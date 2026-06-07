@@ -18,15 +18,24 @@ python3 paper_trader.py report    # win-rate, staked, P&L, EV per $1, ROI
 python3 paper_trader.py run       # foreground daemon (alt to launchd)
 ```
 
-## 24/7 (already installed)
-launchd agent `com.ohm.polymarket-paper` runs `run-cycle.sh` (resolve + tick) at :46 and
-:53 every hour. Survives sleep, runs on wake.
+## 24/7 — runs in GitHub's cloud (laptop-independent)
+A GitHub Actions workflow (`.github/workflows/tick.yml`) runs resolve+tick on a cron
+(`46,49,53,56 * * * *`, several slots to absorb GitHub's scheduling lag) and commits
+`trades.db` back to the repo. Runs whether your Mac is open, asleep, or in your bag.
+
+Repo: https://github.com/howwohmm/polymarket-paper (private)
 
 ```bash
-launchctl list | grep polymarket                                  # is it running?
-tail -f cycle.log                                                  # watch live
-launchctl unload ~/Library/LaunchAgents/com.ohm.polymarket-paper.plist   # stop it
+gh run list --workflow=paper-trader-tick      # recent cloud runs
+gh workflow run paper-trader-tick             # trigger one manually
+git pull && python3 paper_trader.py report    # pull latest data + see results
 ```
+
+Stop it after the week: disable the workflow in the repo's Actions tab, or delete the repo.
+
+The laptop launchd option (`com.ohm.polymarket-paper.plist`, `run-cycle.sh`) is still in
+the repo if you ever want a local-only run, but it's NOT installed — cloud is the source
+of truth so the dataset lives in one place.
 
 ## after a week
 Run `report`. If P&L is positive across ~50+ settled bets, the edge might be real.
