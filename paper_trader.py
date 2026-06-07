@@ -356,6 +356,100 @@ def backfill(hours=72):
     print(f"backfill: scanned {hours}h, added {added} new settled signals")
 
 
+STRATEGIES = [
+    # (name, side, low, high)  side: 'fade' buys the underdog, 'ride' buys the leader
+    ("fade favorite 88-98%",   "fade", 0.88, 0.98),
+    ("fade 80-88%",            "fade", 0.80, 0.88),
+    ("fade extreme 98-99.9%",  "fade", 0.98, 0.999),
+    ("ride favorite 88-98%",   "ride", 0.88, 0.98),
+    ("ride 70-88%",            "ride", 0.70, 0.88),
+    ("ride 55-70%",            "ride", 0.55, 0.70),
+    ("ride extreme 98-99.9%",  "ride", 0.98, 0.999),
+]
+
+
+def compare_strategies(hours=72):
+    """Backtest every strategy in STRATEGIES over the last `hours` of real hourly
+    markets, using the same minute-by-minute price history. Flat $10/signal so ROI
+    is comparable. Mid-price entry (no order book in history) — note the underdog
+    'fade' sides are optimistic (real penny-book slippage makes them worse); 'ride'
+    sides are near-realistic (the leader side is liquid)."""
+    floor_hr = now_utc().replace(minute=0, second=0, microsecond=0)
+    STAKE = 10.0
+    tally = {s[0]: {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0} for s in STRATEGIES}
+    markets = 0
+    for h in range(1, hours + 1):
+        wstart = floor_hr - timedelta(hours=h)
+        et = wstart + ET_OFFSET
+        ampm = "am" if et.hour < 12 else "pm"
+        hr12 = et.hour % 12 or 12
+        for coin in COINS:
+            slug = f"{coin}-up-or-down-{MONTHS[et.month-1]}-{et.day}-{et.year}-{hr12}{ampm}-et"
+            try:
+                r = get(f"{GAMMA}/markets?slug={slug}&closed=true")
+            except Exception:
+                continue
+            if not r:
+                continue
+            m = r[0]
+            try:
+                finals = [float(p) for p in json.loads(m["outcomePrices"])]
+                tokens = json.loads(m["clobTokenIds"])
+            except Exception:
+                continue
+            win_idx = max(range(len(finals)), key=lambda i: finals[i])
+            if finals[win_idx] < 0.9:
+                continue
+            ws = int(wstart.timestamp())
+            try:
+                hist = get(f"{CLOB}/prices-history?market={tokens[0]}"
+                           f"&startTs={ws-180}&endTs={ws+3780}&fidelity=1").get("history", [])
+            except Exception:
+                continue
+            if not hist:
+                continue
+            markets += 1
+
+            def price_at(ts):
+                return min(hist, key=lambda pt: abs(pt["t"] - ts))["p"]
+
+            for name, side, lo, hi in STRATEGIES:
+                for dmin in (46, 53):
+                    p_up = price_at(ws + dmin * 60)
+                    lead_idx = 0 if p_up >= 0.5 else 1
+                    lead_price = max(p_up, 1 - p_up)
+                    if not (lo <= lead_price <= hi):
+                        continue
+                    if side == "ride":
+                        bet_idx, entry = lead_idx, lead_price
+                    else:
+                        bet_idx, entry = 1 - lead_idx, max(round(1 - lead_price, 4), 0.01)
+                    shares = STAKE / entry
+                    won = (win_idx == bet_idx)
+                    t = tally[name]
+                    t["n"] += 1
+                    t["wins"] += 1 if won else 0
+                    t["staked"] += STAKE
+                    t["pnl"] += (shares - STAKE) if won else -STAKE
+                    break
+    print("\n" + "=" * 72)
+    print(f"  STRATEGY BAKE-OFF — {markets} real hourly markets, last {hours}h, $10/signal")
+    print("=" * 72)
+    print(f"  {'strategy':<26}{'signals':>8}{'win%':>7}{'P&L':>11}{'ROI':>8}")
+    print("  " + "-" * 68)
+    for name, *_ in sorted(STRATEGIES, key=lambda s: -tally[s[0]]["pnl"]):
+        t = tally[name]
+        if t["n"] == 0:
+            print(f"  {name:<26}{'0':>8}{'—':>7}{'—':>11}{'—':>8}")
+            continue
+        wr = t["wins"] / t["n"] * 100
+        roi = t["pnl"] / t["staked"] * 100
+        print(f"  {name:<26}{t['n']:>8}{wr:>6.0f}%{('$%+.2f' % t['pnl']):>11}{('%+.0f%%' % roi):>8}")
+    print("=" * 72)
+    print("  note: 'fade' (buy underdog) entries are optimistic — real penny-book")
+    print("  slippage makes them worse. 'ride' (buy favorite) entries are realistic.\n")
+
+
 def report():
     c = db()
     rows = c.execute("SELECT status,stake,payout,pnl,gate_pass FROM bets").fetchall()
@@ -403,5 +497,8 @@ if __name__ == "__main__":
     if cmd == "backfill":
         hrs = int(sys.argv[2]) if len(sys.argv) > 2 else 72
         backfill(hrs)
+    elif cmd == "strategies":
+        hrs = int(sys.argv[2]) if len(sys.argv) > 2 else 72
+        compare_strategies(hrs)
     else:
         {"tick": tick, "resolve": resolve, "report": report, "run": run}.get(cmd, report)()
