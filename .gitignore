@@ -1,0 +1,7 @@
+# local laptop run artifacts — the cloud is the source of truth now
+cycle.log
+launchd.out.log
+launchd.err.log
+__pycache__/
+*.pyc
+# NOTE: trades.db is intentionally tracked — it's the persisted state store.

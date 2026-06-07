@@ -1,0 +1,42 @@
+name: paper-trader-tick
+
+# GitHub's cron can run a few minutes late, so we fire several slots around the
+# strategy's :46 and :53 targets. The dedupe guard in paper_trader.py makes sure
+# the same market is never bet twice, so overlapping/late runs are harmless.
+on:
+  schedule:
+    - cron: "46,49,53,56 * * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+permissions:
+  contents: write   # so the job can commit trades.db back to the repo
+
+concurrency:
+  group: tick       # serialize runs so two pushes never collide
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: resolve + tick
+        run: |
+          python3 paper_trader.py resolve
+          python3 paper_trader.py tick
+          python3 paper_trader.py report
+      - name: persist results
+        run: |
+          git config user.name "polymarket-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add trades.db
+          if git diff --staged --quiet; then
+            echo "no change this run"
+          else
+            git commit -m "tick $(date -u +%FT%TZ)"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
