@@ -133,7 +133,10 @@ def find_hourly_market(coin: str):
 def simulate_buy(token_id: str, stake: float):
     """Walk the orderbook asks to fill `stake` USD. Returns (avg_price, shares, slippage)
     or None if the book can't fill it."""
-    book = get(f"{CLOB}/book?token_id={token_id}")
+    try:
+        book = get(f"{CLOB}/book?token_id={token_id}")
+    except Exception:
+        return None
     asks = sorted(({"p": float(a["price"]), "s": float(a["size"])} for a in book.get("asks", [])),
                   key=lambda x: x["p"])
     if not asks:
@@ -368,21 +371,35 @@ STRATEGIES = [
 ]
 
 
-def compare_strategies(hours=72):
-    """Backtest every strategy in STRATEGIES over the last `hours` of real hourly
-    markets, using the same minute-by-minute price history. Flat $10/signal so ROI
-    is comparable. Mid-price entry (no order book in history) — note the underdog
-    'fade' sides are optimistic (real penny-book slippage makes them worse); 'ride'
-    sides are near-realistic (the leader side is liquid)."""
+def slip_pct(price):
+    """Realistic order-book slippage for a ~$10 market buy, calibrated to live book
+    samples observed on these markets (underdog @0.03-0.05 filled ~48-57% worse than
+    best ask on $25; cheaper = thinner = worse). The leader side (0.55-0.99) is liquid."""
+    if price >= 0.30: return 0.02
+    if price >= 0.15: return 0.06
+    if price >= 0.08: return 0.15
+    if price >= 0.04: return 0.30
+    if price >= 0.02: return 0.45
+    return 0.70
+
+
+def compare_strategies(hours=288):
+    """Backtest every strategy over the last `hours` of real hourly markets, NET of a
+    realistic slippage model, and SPLIT into in-sample (older half) vs out-of-sample
+    (recent half). A real edge survives out-of-sample; an overfit/lucky one collapses.
+    Flat $10/signal."""
     floor_hr = now_utc().replace(minute=0, second=0, microsecond=0)
     STAKE = 10.0
-    tally = {s[0]: {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0} for s in STRATEGIES}
+    split = hours // 2  # signals older than this = in-sample, newer = out-of-sample
+    blank = lambda: {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0}
+    tally = {s[0]: {"IS": blank(), "OOS": blank()} for s in STRATEGIES}
     markets = 0
     for h in range(1, hours + 1):
         wstart = floor_hr - timedelta(hours=h)
         et = wstart + ET_OFFSET
         ampm = "am" if et.hour < 12 else "pm"
         hr12 = et.hour % 12 or 12
+        bucket = "IS" if h > split else "OOS"
         for coin in COINS:
             slug = f"{coin}-up-or-down-{MONTHS[et.month-1]}-{et.day}-{et.year}-{hr12}{ampm}-et"
             try:
@@ -420,34 +437,39 @@ def compare_strategies(hours=72):
                     lead_price = max(p_up, 1 - p_up)
                     if not (lo <= lead_price <= hi):
                         continue
-                    if side == "ride":
-                        bet_idx, entry = lead_idx, lead_price
-                    else:
-                        bet_idx, entry = 1 - lead_idx, max(round(1 - lead_price, 4), 0.01)
+                    bet_idx = lead_idx if side == "ride" else 1 - lead_idx
+                    mid = lead_price if side == "ride" else max(round(1 - lead_price, 4), 0.01)
+                    entry = min(0.99, mid * (1 + slip_pct(mid)))   # apply realistic fill
                     shares = STAKE / entry
                     won = (win_idx == bet_idx)
-                    t = tally[name]
+                    t = tally[name][bucket]
                     t["n"] += 1
                     t["wins"] += 1 if won else 0
                     t["staked"] += STAKE
                     t["pnl"] += (shares - STAKE) if won else -STAKE
                     break
-    print("\n" + "=" * 72)
-    print(f"  STRATEGY BAKE-OFF — {markets} real hourly markets, last {hours}h, $10/signal")
-    print("=" * 72)
-    print(f"  {'strategy':<26}{'signals':>8}{'win%':>7}{'P&L':>11}{'ROI':>8}")
-    print("  " + "-" * 68)
-    for name, *_ in sorted(STRATEGIES, key=lambda s: -tally[s[0]]["pnl"]):
-        t = tally[name]
-        if t["n"] == 0:
-            print(f"  {name:<26}{'0':>8}{'—':>7}{'—':>11}{'—':>8}")
-            continue
-        wr = t["wins"] / t["n"] * 100
-        roi = t["pnl"] / t["staked"] * 100
-        print(f"  {name:<26}{t['n']:>8}{wr:>6.0f}%{('$%+.2f' % t['pnl']):>11}{('%+.0f%%' % roi):>8}")
-    print("=" * 72)
-    print("  note: 'fade' (buy underdog) entries are optimistic — real penny-book")
-    print("  slippage makes them worse. 'ride' (buy favorite) entries are realistic.\n")
+
+    def roi(b):
+        return (b["pnl"] / b["staked"] * 100) if b["staked"] else None
+    print("\n" + "=" * 78)
+    print(f"  STRATEGY BAKE-OFF (net of slippage) — {markets} real markets, {hours//24}d, $10/signal")
+    print(f"  IS = in-sample (older {split//24}d)   OOS = out-of-sample (recent {split//24}d)")
+    print("=" * 78)
+    print(f"  {'strategy':<24}{'IS n':>6}{'IS ROI':>9}{'OOS n':>7}{'OOS ROI':>9}   verdict")
+    print("  " + "-" * 74)
+    for name, *_ in sorted(STRATEGIES, key=lambda s: -(roi(tally[s[0]]['OOS']) or -999)):
+        IS, OOS = tally[name]["IS"], tally[name]["OOS"]
+        ri, ro = roi(IS), roi(OOS)
+        ris = f"{ri:+.0f}%" if ri is not None else "—"
+        ros = f"{ro:+.0f}%" if ro is not None else "—"
+        if ri is not None and ro is not None:
+            v = "HOLDS" if (ri > 0 and ro > 0) else "FELL APART" if ri > 0 else "loses both"
+        else:
+            v = "too few signals"
+        print(f"  {name:<24}{IS['n']:>6}{ris:>9}{OOS['n']:>7}{ros:>9}   {v}")
+    print("=" * 78)
+    print("  HOLDS = profitable in BOTH halves (edge may be real). FELL APART = profitable")
+    print("  in-sample but lost out-of-sample (overfit/luck). Slippage model in slip_pct().\n")
 
 
 def report():
