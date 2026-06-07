@@ -87,43 +87,46 @@ def log_tick(c, action, detail):
 
 
 # ---- market discovery ------------------------------------------------------
+MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+          "august", "september", "october", "november", "december"]
+ET_OFFSET = timedelta(hours=-4)   # EDT (valid for the June test window; ET = UTC-4)
+
+
+def current_hour_slug(coin: str):
+    """Build the slug for the hourly up/down market covering the current ET hour,
+    e.g. 'bitcoin-up-or-down-june-7-2026-6pm-et', plus its UTC resolution time
+    (the next top of the hour). Polymarket's gamma `endDate` is a ~1-day-out
+    placeholder, so we compute the real expiry ourselves."""
+    et = now_utc() + ET_OFFSET
+    h = et.hour
+    ampm = "am" if h < 12 else "pm"
+    hr12 = h % 12 or 12
+    slug = f"{coin}-up-or-down-{MONTHS[et.month-1]}-{et.day}-{et.year}-{hr12}{ampm}-et"
+    expiry = (now_utc().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    return slug, expiry
+
+
 def find_hourly_market(coin: str):
     """Return the live hourly up/down market dict for `coin`, or None.
 
-    Hourly markets have slugs like 'bitcoin-up-or-down-june-9-2026-12pm-et' and
-    resolve at the top of the hour. We pick the active one with the soonest
-    future endDate (= the current hour's market)."""
-    events = get(f"{GAMMA}/events?closed=false&limit=400&order=startDate"
-                 f"&ascending=false&tag_slug=crypto")
-    best = None
-    for e in events:
-        s = e.get("slug", "")
-        if not s.startswith(f"{coin}-up-or-down"):
-            continue
-        if "-et" not in s:            # the hourly variant carries an ET hour suffix
-            continue
-        if "updown-5m" in s or "updown-15m" in s:
-            continue
-        for m in e.get("markets", []):
-            if m.get("closed") or not m.get("active"):
-                continue
-            try:
-                end = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
-            except Exception:
-                continue
-            if end <= now_utc():
-                continue
-            if best is None or end < best[0]:
-                best = (end, e, m)
-    if not best:
+    Fetched deterministically by the current-hour slug (robust against the API's
+    date-ordering/pagination, which hides the now-window markets)."""
+    slug, expiry = current_hour_slug(coin)
+    try:
+        r = get(f"{GAMMA}/markets?slug={slug}")
+    except Exception:
         return None
-    _, e, m = best
-    return {"slug": e["slug"], "market_id": str(m.get("id")),
+    if not r:
+        return None
+    m = r[0]
+    if m.get("closed") or not m.get("active"):
+        return None
+    return {"slug": slug, "market_id": str(m.get("id")),
             "question": m.get("question", ""),
             "outcomes": json.loads(m["outcomes"]),
             "prices": [float(p) for p in json.loads(m["outcomePrices"])],
             "tokens": json.loads(m["clobTokenIds"]),
-            "end_date": m["endDate"]}
+            "end_date": expiry.isoformat()}
 
 
 def simulate_buy(token_id: str, stake: float):
