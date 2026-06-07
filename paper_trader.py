@@ -73,7 +73,8 @@ def db():
         leading_outcome TEXT, leading_price REAL,
         underdog_outcome TEXT, underdog_token TEXT,
         entry_price REAL, slippage REAL, gate_pass INTEGER, stake REAL, shares REAL,
-        end_date TEXT, status TEXT, payout REAL, pnl REAL, resolve_ts TEXT)""")
+        end_date TEXT, status TEXT, payout REAL, pnl REAL, resolve_ts TEXT,
+        source TEXT, decision_min INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS ticks(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, action TEXT, detail TEXT)""")
     return c
@@ -273,6 +274,88 @@ def _stat_block(label, settled):
     print(f"     verdict:        {'+EV (edge?)' if pnl > 0 else '-EV (losing, as expected)'}")
 
 
+def backfill(hours=72):
+    """Reconstruct the strategy over the last `hours` completed hourly markets using
+    Polymarket's minute-by-minute price history. For each market we read the price at
+    :46 and :53 past the hour (the strategy's check times), take the first moment the
+    leader is in [88%,98%], and settle it against the market's KNOWN outcome.
+
+    History is permanent, so this is idempotent and self-healing: re-running re-scans
+    the window and only inserts markets we haven't recorded yet. A throttled/missed
+    scheduled run therefore loses nothing — the next run backfills the gap.
+
+    Entry uses the historical mid price (no order book in history), i.e. this measures
+    the RAW fade edge. Real execution suffers the penny-underdog slippage we observed
+    live, so these are recorded gate_pass=0 (they'd be blocked by the 4% rule)."""
+    c = db()
+    floor_hr = now_utc().replace(minute=0, second=0, microsecond=0)
+    added = 0
+    for h in range(1, hours + 1):
+        wstart = floor_hr - timedelta(hours=h)
+        et = wstart + ET_OFFSET
+        ampm = "am" if et.hour < 12 else "pm"
+        hr12 = et.hour % 12 or 12
+        for coin in COINS:
+            slug = f"{coin}-up-or-down-{MONTHS[et.month-1]}-{et.day}-{et.year}-{hr12}{ampm}-et"
+            try:
+                r = get(f"{GAMMA}/markets?slug={slug}&closed=true")
+            except Exception:
+                continue
+            if not r:
+                continue
+            m = r[0]
+            mid = str(m.get("id"))
+            if c.execute("SELECT 1 FROM bets WHERE market_id=?", (mid,)).fetchone():
+                continue  # already recorded
+            try:
+                outcomes = json.loads(m["outcomes"])
+                finals = [float(p) for p in json.loads(m["outcomePrices"])]
+                tokens = json.loads(m["clobTokenIds"])
+            except Exception:
+                continue
+            win_idx = max(range(len(finals)), key=lambda i: finals[i])
+            if finals[win_idx] < 0.9:        # not a clean 1/0 settlement -> skip (void/50-50)
+                continue
+            ws = int(wstart.timestamp())
+            try:
+                hist = get(f"{CLOB}/prices-history?market={tokens[0]}"
+                           f"&startTs={ws-180}&endTs={ws+3600+180}&fidelity=1").get("history", [])
+            except Exception:
+                continue
+            if not hist:
+                continue
+
+            def price_at(ts):
+                return min(hist, key=lambda pt: abs(pt["t"] - ts))["p"]
+
+            for dmin in (46, 53):
+                p_up = price_at(ws + dmin * 60)
+                lead_idx = 0 if p_up >= 0.5 else 1
+                lead_price = max(p_up, 1 - p_up)
+                if not (SIGNAL_LOW <= lead_price <= SIGNAL_HIGH):
+                    continue
+                under_idx = 1 - lead_idx
+                entry = round(1 - lead_price, 4) or 0.01
+                stake = size_for(lead_price)
+                shares = stake / entry
+                won = (win_idx == under_idx)
+                payout = shares if won else 0.0
+                pnl = payout - stake
+                c.execute("""INSERT INTO bets(ts,coin,market_id,slug,question,leading_outcome,
+                    leading_price,underdog_outcome,underdog_token,entry_price,slippage,gate_pass,
+                    stake,shares,end_date,status,payout,pnl,resolve_ts,source,decision_min)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (wstart.isoformat(), coin, mid, slug, m.get("question", ""),
+                     outcomes[lead_idx], lead_price, outcomes[under_idx], tokens[under_idx],
+                     entry, None, 0, stake, shares, (wstart + timedelta(hours=1)).isoformat(),
+                     "won" if won else "lost", payout, pnl, now_utc().isoformat(),
+                     "backfill", dmin))
+                c.commit()
+                added += 1
+                break  # one bet per market (first in-band check time)
+    print(f"backfill: scanned {hours}h, added {added} new settled signals")
+
+
 def report():
     c = db()
     rows = c.execute("SELECT status,stake,payout,pnl,gate_pass FROM bets").fetchall()
@@ -317,4 +400,8 @@ def run():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
-    {"tick": tick, "resolve": resolve, "report": report, "run": run}.get(cmd, report)()
+    if cmd == "backfill":
+        hrs = int(sys.argv[2]) if len(sys.argv) > 2 else 72
+        backfill(hrs)
+    else:
+        {"tick": tick, "resolve": resolve, "report": report, "run": run}.get(cmd, report)()
