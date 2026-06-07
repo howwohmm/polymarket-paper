@@ -72,7 +72,7 @@ def db():
         ts TEXT, coin TEXT, market_id TEXT, slug TEXT, question TEXT,
         leading_outcome TEXT, leading_price REAL,
         underdog_outcome TEXT, underdog_token TEXT,
-        entry_price REAL, slippage REAL, stake REAL, shares REAL,
+        entry_price REAL, slippage REAL, gate_pass INTEGER, stake REAL, shares REAL,
         end_date TEXT, status TEXT, payout REAL, pnl REAL, resolve_ts TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS ticks(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, action TEXT, detail TEXT)""")
@@ -200,24 +200,26 @@ def tick():
 
     sim = simulate_buy(under_token, stake)
     if sim is None:
-        log_tick(c, "SKIP", f"{coin}: orderbook too thin to fill ${stake} on {under_outcome}")
+        log_tick(c, "SKIP", f"{coin}: orderbook can't fill ${stake} at any price on {under_outcome}")
         return
     entry, shares, slippage = sim
-    if slippage > MAX_SLIPPAGE:
-        log_tick(c, "SKIP", f"{coin}: slippage {slippage*100:.2f}% > {MAX_SLIPPAGE*100:.0f}% "
-                            f"on {under_outcome}")
-        return
-
+    gate_pass = 1 if slippage <= MAX_SLIPPAGE else 0
+    # Shadow mode: record EVERY signal at its realistic walked-book fill, but flag
+    # whether the strategy's own 4% slippage rule would actually allow it. This lets
+    # the week's report show both "strategy-as-written" (gate-passing trades) AND the
+    # raw fade edge (all signals) — otherwise the slippage gate blocks ~everything and
+    # we learn nothing.
     c.execute("""INSERT INTO bets(ts,coin,market_id,slug,question,leading_outcome,leading_price,
-        underdog_outcome,underdog_token,entry_price,slippage,stake,shares,end_date,status,payout,pnl)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        underdog_outcome,underdog_token,entry_price,slippage,gate_pass,stake,shares,end_date,status,payout,pnl)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (now_utc().isoformat(), coin, mk["market_id"], mk["slug"], mk["question"],
          mk["outcomes"][lead_idx], lead_price, under_outcome, under_token,
-         entry, slippage, stake, shares, mk["end_date"], "open", None, None))
+         entry, slippage, gate_pass, stake, shares, mk["end_date"], "open", None, None))
     c.commit()
+    flag = "" if gate_pass else "  [GATE-BLOCKED: slippage > 4%]"
     log_tick(c, "BET", f"{coin} {mk['question']} | leader {mk['outcomes'][lead_idx]} @ {lead_price:.3f} "
                        f"-> ${stake:.0f} on {under_outcome} @ {entry:.3f} "
-                       f"({shares:.1f} shares, slip {slippage*100:.2f}%)")
+                       f"({shares:.1f} shares, slip {slippage*100:.1f}%){flag}")
 
 
 def resolve():
@@ -254,37 +256,45 @@ def resolve():
               f"(P&L ${pnl:+.2f})")
 
 
-def report():
-    c = db()
-    rows = c.execute("SELECT status,stake,payout,pnl,coin,leading_price,entry_price "
-                     "FROM bets").fetchall()
-    settled = [r for r in rows if r[0] in ("won", "lost")]
-    opens = [r for r in rows if r[0] == "open"]
-    voids = [r for r in rows if r[0] == "void"]
+def _stat_block(label, settled):
     wins = [r for r in settled if r[0] == "won"]
     staked = sum(r[1] for r in settled)
     pnl = sum(r[3] for r in settled)
-    print("\n" + "=" * 56)
+    print(f"  -- {label} --")
+    if not settled:
+        print("     no settled bets in this bucket yet")
+        return
+    wr = len(wins) / len(settled) * 100
+    print(f"     settled bets:   {len(settled)}   wins: {len(wins)}  ({wr:.0f}% win rate)")
+    print(f"     staked:         ${staked:.2f}")
+    print(f"     P&L:            ${pnl:+.2f}")
+    if staked:
+        print(f"     EV per $1:      ${pnl/staked:+.3f}   ROI: {pnl/staked*100:+.0f}%")
+    print(f"     verdict:        {'+EV (edge?)' if pnl > 0 else '-EV (losing, as expected)'}")
+
+
+def report():
+    c = db()
+    rows = c.execute("SELECT status,stake,payout,pnl,gate_pass FROM bets").fetchall()
+    settled = [r for r in rows if r[0] in ("won", "lost")]
+    opens = [r for r in rows if r[0] == "open"]
+    voids = [r for r in rows if r[0] == "void"]
+    gated = [r for r in settled if r[4] == 1]   # passed the 4% slippage rule
+    blocked = [r for r in settled if r[4] == 0]
+    print("\n" + "=" * 60)
     print("  POLYMARKET PAPER TRADER — fade-the-favorite report")
-    print("=" * 56)
-    print(f"  bets placed (settled): {len(settled)}   open: {len(opens)}   void: {len(voids)}")
-    if settled:
-        wr = len(wins) / len(settled) * 100
-        print(f"  win rate:              {wr:.1f}%  ({len(wins)}/{len(settled)})")
-        print(f"  total staked:          ${staked:.2f}")
-        print(f"  total P&L:             ${pnl:+.2f}")
-        print(f"  EV per $1 staked:      ${pnl/staked:+.3f}" if staked else "")
-        roi = pnl / staked * 100 if staked else 0
-        print(f"  ROI:                   {roi:+.1f}%")
-        if wins:
-            avg_win = sum(r[3] for r in wins) / len(wins)
-            print(f"  avg win:               ${avg_win:+.2f}")
-        verdict = "+EV so far (strategy may have edge)" if pnl > 0 else \
-                  "-EV so far (fading favorites is losing money, as expected)"
-        print(f"  verdict:               {verdict}")
-    else:
-        print("  no settled bets yet — let it run a few hours.")
-    print("=" * 56 + "\n")
+    print("=" * 60)
+    print(f"  signals taken: {len(rows)}   settled: {len(settled)}   "
+          f"open: {len(opens)}   void: {len(voids)}")
+    print(f"  of settled: {len(gated)} executable under 4% slippage rule, "
+          f"{len(blocked)} blocked by it")
+    print()
+    # the strategy AS WRITTEN only trades the gate-passers
+    _stat_block("STRATEGY AS WRITTEN (only trades passing the 4% slippage gate)", gated)
+    print()
+    # the raw edge: would fading favorites win if you ignored slippage entirely?
+    _stat_block("RAW FADE EDGE (all signals, slippage ignored)", settled)
+    print("=" * 60 + "\n")
 
 
 def run():
