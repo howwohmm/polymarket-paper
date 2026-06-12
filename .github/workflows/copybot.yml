@@ -4,7 +4,7 @@ name: copybot-tick
 # (settle/mark) is bounded per run. Self-healing — missed runs lose nothing.
 on:
   schedule:
-    - cron: "17 * * * *"   # hourly, off-peak minute
+    - cron: "11 * * * *"   # hourly trigger; each run self-loops to tick every 3 min
   workflow_dispatch: {}
 
 permissions:
@@ -17,15 +17,20 @@ concurrency:
 jobs:
   copybot:
     runs-on: ubuntu-latest
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: tick + resolve + report
+      - name: tick every 3 min for ~55 min, then resolve
         run: |
-          python3 copybot.py tick
-          python3 copybot.py resolve
+          for i in $(seq 1 18); do
+            echo "--- tick $i/18 ($(date -u +%T)) ---"
+            python3 copybot.py tick || true
+            [ "$i" -lt 18 ] && sleep 180
+          done
+          python3 copybot.py resolve || true
           python3 copybot.py report
       - name: persist
         run: |
