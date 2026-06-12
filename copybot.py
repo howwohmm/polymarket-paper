@@ -330,7 +330,7 @@ def _model_summary(c, model):
         positions.append(dict(wallet=w, title=(t or "")[:80], outcome=o, entry=e, current=mk,
                               gain=round(gain, 1), status=st, pnl=round(pnl, 2) if pnl is not None else None,
                               why=why))
-    allr = c.execute("SELECT status,pnl FROM copies WHERE model=?", (model,)).fetchall()
+    allr = c.execute("SELECT status,pnl,stake FROM copies WHERE model=?", (model,)).fetchall()
     closed = [r for r in allr if r[0] in CLOSED]
     wins = [r for r in closed if (r[1] or 0) > 0]
     openr = [r for r in allr if r[0] == "open"]
@@ -338,6 +338,8 @@ def _model_summary(c, model):
                 win_rate=round(len(wins) / len(closed) * 100, 1) if closed else 0,
                 realized=round(sum(r[1] or 0 for r in closed), 2),
                 unreal=round(sum(r[1] or 0 for r in openr), 2),
+                invested=round(sum(r[2] or 0 for r in allr), 2),     # total $ deployed (all copies)
+                at_risk=round(sum(r[2] or 0 for r in openr), 2),     # $ in still-open positions
                 positions=positions[:60])
 
 

@@ -80,6 +80,7 @@ async function load(){
     return `<div class="m"><h3>${NAMES[k]}</h3>
       <div class="pnl ${cls(m.realized)}">${J(m.realized)}</div>
       <div class="pl">realized p&l (${m.closed} closed)</div>
+      <div class="pl">$${(m.invested||0).toLocaleString()} invested · $${(m.at_risk||0).toLocaleString()} at risk now</div>
       <div class="grid">
         <div><b>${m.win_rate}%</b><span>win rate</span></div>
         <div><b>${m.open}</b><span>open</span></div>
