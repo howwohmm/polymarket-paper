@@ -23,7 +23,7 @@ import sqlite3
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 DATA = "https://data-api.polymarket.com"
@@ -34,6 +34,9 @@ STAKE = 10.0
 # force-close after MAX_HOLD so positions turn over fast (-> 1-3 day verdict, not weeks).
 TAKE_PROFIT = 0.15        # exit when the position is +15% (enough margin to profit)
 MAX_HOLD_HOURS = 36       # if it hasn't hit target in 36h, close it out at current price
+# Model A only: skip copying markets that resolve further out than this (short test —
+# no point holding a copy whose market settles in weeks/months). Model B is exempt.
+MAX_HOLD_RESOLVE_DAYS = 3
 
 # vetted copyable traders (small clip, taker, diversified, slow markets)
 WALLETS = {
@@ -83,7 +86,38 @@ def db():
         c.execute("ALTER TABLE copies ADD COLUMN model TEXT DEFAULT 'hold'")  # A=hold, B=exit
     except Exception:
         pass
+    c.execute("CREATE TABLE IF NOT EXISTS market_end(condition_id TEXT PRIMARY KEY, end_date TEXT)")
     return c
+
+
+_endcache = {}
+
+
+def _resolves_soon(cid, c):
+    """True if this market resolves within MAX_HOLD_RESOLVE_DAYS. Caches end dates
+    (in-memory + db) so we only look up each market once. Unknown/unfetchable -> False
+    (skip, since a short test can't wait on an unknown resolution)."""
+    if not cid:
+        return False
+    if cid in _endcache:
+        ed = _endcache[cid]
+    else:
+        row = c.execute("SELECT end_date FROM market_end WHERE condition_id=?", (cid,)).fetchone()
+        if row:
+            ed = row[0]
+        else:
+            m = _market_by_condition(cid)
+            ed = m.get("endDate") if m else None
+            c.execute("INSERT OR REPLACE INTO market_end(condition_id,end_date) VALUES(?,?)", (cid, ed))
+        _endcache[cid] = ed
+    if not ed:
+        return False
+    try:
+        end = datetime.fromisoformat(ed.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return now < end <= now + timedelta(days=MAX_HOLD_RESOLVE_DAYS)
+    except Exception:
+        return False
 
 
 # only copy trades fresh enough that the current price ~= their fill (true forward test,
@@ -114,7 +148,11 @@ def tick():
             base = f"{tx}:{asset}:{a.get('timestamp')}"
             entry = their_price            # slow markets: copy fill ~= their fill
             shares = STAKE / entry
+            # Model A only copies markets resolving soon; Model B always copies (exits early)
+            hold_ok = _resolves_soon(a.get("conditionId"), c)
             for model in ("hold", "exit"):   # Model A and Model B, same entry
+                if model == "hold" and not hold_ok:
+                    continue
                 key = f"{base}:{model}"
                 if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
                     continue
