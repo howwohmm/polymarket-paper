@@ -62,7 +62,8 @@ const cell = v => { const c = v>20.05?'pos':v<19.95?'neg':'flat';
 const ago = ts => { const s=(Date.now()-new Date(ts).getTime())/1000;
   if(s<90)return Math.round(s)+'s ago'; if(s<5400)return Math.round(s/60)+'m ago';
   if(s<129600)return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago'; };
-const NAMES={A:'A · hold',B:'B · sell +15%',C:'C · claude'};
+const NAMES={A:'A · hold',B:'B · sell +15%',C:'C · claude',D:'D · cut losers, ride winners'};
+const MK=['A','B','C','D'];
 
 async function load(){
   let d; try{ d=await (await fetch('./data.json?'+Date.now())).json(); }
@@ -70,7 +71,7 @@ async function load(){
   document.getElementById('sub').textContent =
     `updated ${ago(d.updated)} · auto-refresh 60s · each trader gets own $20/model · $2 per copy`;
 
-  document.getElementById('board').innerHTML = ['A','B','C'].map(k=>{ const m=d.models[k]; const dv=m.value-m.started;
+  document.getElementById('board').innerHTML = MK.filter(k=>d.models[k]).map(k=>{ const m=d.models[k]; const dv=m.value-m.started;
     return `<div class="m"><h3>${NAMES[k]}</h3>
       <div class="pnl ${dv>=0?'pos':'neg'}">${money(m.value)}</div>
       <div class="pl">started ${money(m.started)} (${dv>=0?'+':'−'}${money(Math.abs(dv))}) · ${m.closed} closed · ${m.open} open</div>
@@ -79,11 +80,11 @@ async function load(){
   const T=d.traders||[];
   document.getElementById('lb').innerHTML = `<table>
     <tr><th class="rank"></th><th>trader</th>
-        <th class="r">A · hold</th><th class="r">B · sell +15%</th><th class="r">C · claude</th><th class="r">best</th></tr>
-    ${T.map((t,i)=>{ const best=Math.max(t.A.value,t.B.value,t.C.value);
-      const c=(m,v)=>`<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b><span>${t[m].closed} closed</span></td>`;
+        <th class="r">A·hold</th><th class="r">B·+15%</th><th class="r">C·claude</th><th class="r">D·trail</th><th class="r">best</th></tr>
+    ${T.map((t,i)=>{ const vals=MK.map(m=>t[m]?t[m].value:20); const best=Math.max(...vals);
+      const c=(m)=>{ const v=t[m]?t[m].value:20; return `<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b><span>${t[m]?t[m].closed:0} cl</span></td>`; };
       return `<tr><td class="rank">${i+1}</td><td class="nm">${t.name}</td>
-        ${c('A',t.A.value)}${c('B',t.B.value)}${c('C',t.C.value)}
+        ${c('A')}${c('B')}${c('C')}${c('D')}
         <td class="r"><b class="${best>20.05?'pos':best<19.95?'neg':'flat'}">${money(best)}</b></td></tr>`; }).join('')}
   </table>`;
 

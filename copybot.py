@@ -48,6 +48,12 @@ CLAUDE_MODEL = "claude-haiku-4-5"   # cheap; swap to claude-opus-4-6 for smarter
 MAX_CLAUDE_CALLS_PER_RUN = 40       # hard cost cap per workflow run
 CLAUDE_RECHECK_HOURS = 6            # don't re-ask about the same position within 6h
 CDECIDE_MAX_HOLD_HOURS = 72         # backstop: force-close a Claude position after 72h
+# Model D: "cut losers, ride winners" — hard stop-loss + trailing stop. Locks gains on a
+# reversal while letting winners run toward resolution (vs B's fixed +15% cap).
+STOP_LOSS = 0.30            # sell if down 30% from entry (cut the trader's wrong calls fast)
+TRAIL_ACTIVATE = 0.25       # once up 25%, arm the trailing stop
+TRAIL_DROP = 0.20           # then sell if it falls 20% from its peak (lock the win, let it run)
+TRAIL_MAX_HOLD_HOURS = 120  # otherwise hold up to 5 days
 
 # vetted copyable traders (small clip, taker, diversified, slow markets)
 WALLETS = {
@@ -98,7 +104,7 @@ def db():
     except Exception:
         pass
     c.execute("CREATE TABLE IF NOT EXISTS market_end(condition_id TEXT PRIMARY KEY, end_date TEXT)")
-    for col in ("last_check TEXT", "last_reason TEXT"):
+    for col in ("last_check TEXT", "last_reason TEXT", "peak REAL"):
         try:
             c.execute(f"ALTER TABLE copies ADD COLUMN {col}")
         except Exception:
@@ -155,15 +161,27 @@ def _resolves_soon(cid, c):
         return False
 
 
-# only copy trades fresh enough that the current price ~= their fill (true forward test,
-# no look-ahead on their already-moved older positions). Hourly ticks catch everything.
-MAX_TRADE_AGE_SEC = 4 * 3600
+# only copy VERY fresh trades so our entry ~= the trader's fill (a true forward test).
+# The data feed itself lags ~6 min, so 15 min catches new trades while killing the
+# look-ahead bias of copying hours-old, already-moved positions at their stale price.
+MAX_TRADE_AGE_SEC = 15 * 60
+
+# Skip markets that resolve faster than our ~6-min feed lag — by the time we see the
+# trade the outcome is already decided, so copying it is look-ahead, not a real signal.
+# (5/15-min crypto "up or down", in-game sports, etc.) Leaves genuinely copyable markets.
+FAST_MARKET_PATTERNS = ("up or down", "halftime", "at the half", "next goal", "this drive")
+
+
+def _is_fast_market(title):
+    t = (title or "").lower()
+    return any(p in t for p in FAST_MARKET_PATTERNS)
 
 
 def tick():
     c = db()
     now = int(time.time())
     added = 0
+    mkt_cache = {}   # per-tick cache of gamma markets -> current price + endDate
     for name, addr in WALLETS.items():
         try:
             act = get(f"{DATA}/activity?user={addr}&limit=100")
@@ -175,17 +193,40 @@ def tick():
                 continue
             if now - int(a.get("timestamp") or 0) > MAX_TRADE_AGE_SEC:
                 continue  # too old — would be look-ahead, skip
+            if _is_fast_market(a.get("title")):
+                continue  # resolves faster than our feed lag -> can't copy fairly
             asset = a.get("asset")
             tx = a.get("transactionHash") or ""
+            cid = a.get("conditionId")
+            oidx = a.get("outcomeIndex") or 0
             their_price = float(a.get("price") or 0)
-            if not asset or their_price <= 0 or their_price >= 1:
+            if not asset or not cid:
+                continue
+            # fetch the market once (cached per tick); ENTRY = current price (same source we
+            # mark with) => gain starts at 0, no look-ahead regardless of market speed.
+            if cid not in mkt_cache:
+                mkt_cache[cid] = _market_by_condition(cid)
+            m = mkt_cache[cid]
+            if not m:
+                continue
+            try:
+                prices = [float(p) for p in json.loads(m["outcomePrices"])]
+                entry = prices[oidx]
+            except Exception:
+                continue
+            if entry <= 0.02 or entry >= 0.98:   # already (near) resolved -> no fair copy
                 continue
             base = f"{tx}:{asset}:{a.get('timestamp')}"
-            entry = their_price            # slow markets: copy fill ~= their fill
             shares = STAKE / entry
-            # Model A only copies markets resolving soon; Model B always copies (exits early)
-            hold_ok = _resolves_soon(a.get("conditionId"), c)
-            for model in ("hold", "exit", "cdecide"):   # A=hold, B=take-profit, C=Claude
+            # Model A (hold) only for markets resolving within 3 days
+            hold_ok = False
+            try:
+                end = datetime.fromisoformat((m.get("endDate") or "").replace("Z", "+00:00"))
+                hnow = datetime.now(timezone.utc)
+                hold_ok = hnow < end <= hnow + timedelta(days=MAX_HOLD_RESOLVE_DAYS)
+            except Exception:
+                hold_ok = False
+            for model in ("hold", "exit", "cdecide", "trail"):  # A=hold B=+15% C=Claude D=trail
                 if model == "hold" and not hold_ok:
                     continue
                 key = f"{base}:{model}"
@@ -220,12 +261,12 @@ def resolve():
     # newest-open prioritized for Model B (exit needs frequent price checks); bounded by
     # row count + wall-clock so a slow gamma API can't blow the job timeout.
     rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry,"
-                     "COALESCE(model,'hold'),copied_ts,wallet FROM copies "
+                     "COALESCE(model,'hold'),copied_ts,wallet,peak FROM copies "
                      "WHERE status='open' ORDER BY id DESC LIMIT 150").fetchall()
     deadline = time.time() + 300
     now = time.time()
     settled = marked = exited = 0
-    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet in rows:
+    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak in rows:
         if time.time() > deadline:
             print("resolve: hit 5-min deadline, stopping early (rest next run)")
             break
@@ -261,6 +302,25 @@ def resolve():
             else:
                 c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
                           (cur, shares * cur - stake, cid_id)); marked += 1
+        elif model == "trail":                    # Model D: stop-loss + trailing stop
+            pk = max(peak or entry, cur)
+            gain = (cur - entry) / entry if entry else 0
+            try:
+                age_h = (now - datetime.fromisoformat(copied_ts).timestamp()) / 3600
+            except Exception:
+                age_h = 0
+            if gain <= -STOP_LOSS:                # cut a wrong call fast
+                c.execute("UPDATE copies SET status='d_stop',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "trail", wallet, shares * cur); exited += 1
+            elif pk >= entry * (1 + TRAIL_ACTIVATE) and cur <= pk * (1 - TRAIL_DROP):  # winner reversing -> lock it
+                c.execute("UPDATE copies SET status='d_trail',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "trail", wallet, shares * cur); exited += 1
+            elif age_h >= TRAIL_MAX_HOLD_HOURS:
+                c.execute("UPDATE copies SET status='d_closed',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "trail", wallet, shares * cur); exited += 1
+            else:                                 # still running -> update peak, let it ride
+                c.execute("UPDATE copies SET peak=?,mark_price=?,pnl=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, cid_id)); marked += 1
         else:                                     # Model A: hold, just mark-to-market
             c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
                       (cur, shares * cur - stake, cid_id)); marked += 1
@@ -274,8 +334,10 @@ def _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet):
         f"You manage a Polymarket COPY position (mirroring trader {wallet}).\n"
         f'Market: "{title}"\n'
         f"Bought outcome: {outcome} at {entry:.3f}, now {cur:.3f} ({gain*100:+.1f}%), held {age_h:.0f}h.\n"
-        f"Your job: maximize profit, cut losers early, don't give back gains. "
-        f"Decide whether to HOLD or SELL now.\n"
+        f"You're copying a SKILLED trader who bought this expecting it to win. Default to HOLD "
+        f"to capture the full move. SELL only if (a) it's clearly going wrong — down sharply with no "
+        f"path back, or (b) it spiked up and is now reversing (lock the gain). Do NOT bank small early "
+        f"gains — let winners run toward resolution.\n"
         f'Reply with ONLY compact JSON: {{"decision":"HOLD"|"SELL","why":"<=10 words"}}.')
     body = {"model": CLAUDE_MODEL, "max_tokens": 120,
             "messages": [{"role": "user", "content": prompt}]}
@@ -346,14 +408,14 @@ def claude_decide():
     print(f"claude_decide: {calls} calls -> {sold} sold, {held} held, {closed} auto-closed")
 
 
-CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed")
+CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed", "d_stop", "d_trail", "d_closed")
 
 
 def export():
     """Write docs/data.json: each trader's OWN $20 wallet under each model (A/B/C),
     a trader leaderboard (who's worth copying), model aggregates, and Claude's decisions."""
     c = db()
-    MODELS = [("hold", "A"), ("exit", "B"), ("cdecide", "C")]
+    MODELS = [("hold", "A"), ("exit", "B"), ("cdecide", "C"), ("trail", "D")]
     agg = {}   # (model, trader) -> stats
     for model, wallet, status, pnl, stake in c.execute(
             "SELECT model,wallet,status,COALESCE(pnl,0),stake FROM copies"):
@@ -376,7 +438,7 @@ def export():
             row[mn] = dict(value=round(ch + d["at_risk"] + d["unreal"], 2),
                            realized=round(d["realized"], 2), open=d["open"], closed=d["closed"],
                            win_rate=round(d["wins"] / d["closed"] * 100) if d["closed"] else 0)
-        row["best"] = round(max(row["A"]["value"], row["B"]["value"], row["C"]["value"]), 2)
+        row["best"] = round(max(row["A"]["value"], row["B"]["value"], row["C"]["value"], row["D"]["value"]), 2)
         traders.append(row)
     traders.sort(key=lambda r: -r["best"])
 
