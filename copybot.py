@@ -34,7 +34,8 @@ DB = Path(__file__).parent / "copybot.db"
 # positions at once), and can only open a copy if it has free cash. When a position
 # closes, the proceeds return to the wallet to be reused (recycling).
 BANKROLL_PER_MODEL = 20.0
-STAKE = 2.0
+STAKE = 1.0                  # $1 per copy -> $20 spreads across all 20 traders, a fraction each
+MAX_OPEN_PER_TRADER = 1      # at most 1 open position per trader per model (even spread)
 # Model B (take-profit exit): sell our copy when it's up enough to bank a margin, or
 # force-close after MAX_HOLD so positions turn over fast (-> 1-3 day verdict, not weeks).
 TAKE_PROFIT = 0.15        # exit when the position is +15% (enough margin to profit)
@@ -186,6 +187,10 @@ def tick():
                     continue
                 key = f"{base}:{model}"
                 if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
+                    continue
+                # even spread: at most 1 open position per trader per model
+                if c.execute("SELECT COUNT(*) FROM copies WHERE model=? AND wallet=? AND status='open'",
+                             (model, name)).fetchone()[0] >= MAX_OPEN_PER_TRADER:
                     continue
                 if _cash(c, model) < STAKE:     # wallet's out of cash -> can't copy (realistic)
                     continue

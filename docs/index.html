@@ -74,7 +74,7 @@ async function load(){
   catch(e){ document.getElementById('sub').textContent='no data yet — bot is warming up'; return; }
   const d=DATA;
   document.getElementById('sub').textContent =
-    `updated ${ago(d.updated)} · auto-refreshes 60s · $10 paper per copy`;
+    `updated ${ago(d.updated)} · auto-refreshes 60s · $20 wallet/model · $1 per copy · 20 traders`;
 
   document.getElementById('board').innerHTML = ['A','B','C'].map(k=>{ const m=d.models[k];
     return `<div class="m"><h3>${NAMES[k]}</h3>
