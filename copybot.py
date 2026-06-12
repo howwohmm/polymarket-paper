@@ -321,31 +321,40 @@ def claude_decide():
     print(f"claude_decide: {calls} calls -> {sold} sold, {held} held, {closed} auto-closed")
 
 
-def export():
-    """Write docs/model_c.json for the live dashboard (Model C only)."""
-    c = db()
-    pos = c.execute("SELECT wallet,title,outcome,entry,mark_price,stake,pnl,status,last_reason,copied_ts "
-                    "FROM copies WHERE model='cdecide' ORDER BY id DESC").fetchall()
+def _model_summary(c, model):
+    rows = c.execute("SELECT wallet,title,outcome,entry,mark_price,pnl,status,last_reason "
+                     "FROM copies WHERE model=? ORDER BY id DESC LIMIT 100", (model,)).fetchall()
     positions = []
-    for w, t, o, e, mk, stake, pnl, st, why, cts in pos:
+    for w, t, o, e, mk, pnl, st, why in rows:
         gain = ((mk - e) / e * 100) if (mk and e) else 0
         positions.append(dict(wallet=w, title=(t or "")[:80], outcome=o, entry=e, current=mk,
                               gain=round(gain, 1), status=st, pnl=round(pnl, 2) if pnl is not None else None,
-                              why=why, opened=cts))
-    decs = c.execute("SELECT ts,wallet,title,entry,current,gain,decision,why FROM decisions "
+                              why=why))
+    allr = c.execute("SELECT status,pnl FROM copies WHERE model=?", (model,)).fetchall()
+    closed = [r for r in allr if r[0] in CLOSED]
+    wins = [r for r in closed if (r[1] or 0) > 0]
+    openr = [r for r in allr if r[0] == "open"]
+    return dict(open=len(openr), closed=len(closed), wins=len(wins),
+                win_rate=round(len(wins) / len(closed) * 100, 1) if closed else 0,
+                realized=round(sum(r[1] or 0 for r in closed), 2),
+                unreal=round(sum(r[1] or 0 for r in openr), 2),
+                positions=positions[:60])
+
+
+def export():
+    """Write docs/data.json for the live dashboard — all three models A/B/C + C's decisions."""
+    c = db()
+    models = {"A": _model_summary(c, "hold"),
+              "B": _model_summary(c, "exit"),
+              "C": _model_summary(c, "cdecide")}
+    decs = c.execute("SELECT ts,wallet,title,outcome,entry,current,gain,decision,why FROM decisions "
                      "ORDER BY id DESC LIMIT 200").fetchall()
-    decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], entry=d[3], current=d[4],
-                      gain=round((d[5] or 0) * 100, 1), decision=d[6], why=d[7]) for d in decs]
-    closed = [p for p in positions if p["status"] in ("c_sold", "c_closed", "won", "lost")]
-    wins = [p for p in closed if (p["pnl"] or 0) > 0]
-    kpi = dict(open=sum(1 for p in positions if p["status"] == "open"), closed=len(closed),
-               wins=len(wins), win_rate=round(len(wins) / len(closed) * 100, 1) if closed else 0,
-               realized=round(sum(p["pnl"] or 0 for p in closed), 2), decisions=len(decisions),
-               sold=sum(1 for p in positions if p["status"] == "c_sold"))
+    decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], outcome=d[3], entry=d[4],
+                      current=d[5], gain=round((d[6] or 0) * 100, 1), decision=d[7], why=d[8]) for d in decs]
     os.makedirs("docs", exist_ok=True)
-    json.dump(dict(updated=now_iso(), kpi=kpi, positions=positions[:300], decisions=decisions),
-              open("docs/model_c.json", "w"))
-    print("export: wrote docs/model_c.json ->", kpi)
+    out = dict(updated=now_iso(), models=models, decisions=decisions)
+    json.dump(out, open("docs/data.json", "w"))
+    print("export: wrote docs/data.json ->", {k: (v["closed"], v["realized"]) for k, v in models.items()})
 
 
 CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed")
