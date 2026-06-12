@@ -30,6 +30,10 @@ DATA = "https://data-api.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 DB = Path(__file__).parent / "copybot.db"
 STAKE = 10.0
+# Model B (take-profit exit): sell our copy when it's up enough to bank a margin, or
+# force-close after MAX_HOLD so positions turn over fast (-> 1-3 day verdict, not weeks).
+TAKE_PROFIT = 0.15        # exit when the position is +15% (enough margin to profit)
+MAX_HOLD_HOURS = 36       # if it hasn't hit target in 36h, close it out at current price
 
 # vetted copyable traders (small clip, taker, diversified, slow markets)
 WALLETS = {
@@ -75,6 +79,10 @@ def db():
         condition_id TEXT, asset TEXT, title TEXT, outcome TEXT, outcome_index INTEGER,
         their_price REAL, entry REAL, stake REAL, shares REAL,
         status TEXT, mark_price REAL, pnl REAL, resolved_ts TEXT)""")
+    try:
+        c.execute("ALTER TABLE copies ADD COLUMN model TEXT DEFAULT 'hold'")  # A=hold, B=exit
+    except Exception:
+        pass
     return c
 
 
@@ -103,21 +111,22 @@ def tick():
             their_price = float(a.get("price") or 0)
             if not asset or their_price <= 0 or their_price >= 1:
                 continue
-            key = f"{tx}:{asset}:{a.get('timestamp')}"
-            if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
-                continue
+            base = f"{tx}:{asset}:{a.get('timestamp')}"
             entry = their_price            # slow markets: copy fill ~= their fill
             shares = STAKE / entry
-            c.execute("""INSERT OR IGNORE INTO copies(key,copied_ts,wallet,their_ts,condition_id,
-                asset,title,outcome,outcome_index,their_price,entry,stake,shares,status)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (key, now_iso(), name, a.get("timestamp"), a.get("conditionId"), asset,
-                 (a.get("title") or "")[:80], a.get("outcome"), a.get("outcomeIndex"),
-                 their_price, entry, STAKE, shares, "open"))
-            if c.total_changes:
+            for model in ("hold", "exit"):   # Model A and Model B, same entry
+                key = f"{base}:{model}"
+                if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
+                    continue
+                c.execute("""INSERT OR IGNORE INTO copies(key,copied_ts,wallet,their_ts,condition_id,
+                    asset,title,outcome,outcome_index,their_price,entry,stake,shares,status,model)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (key, now_iso(), name, a.get("timestamp"), a.get("conditionId"), asset,
+                     (a.get("title") or "")[:80], a.get("outcome"), a.get("outcomeIndex"),
+                     their_price, entry, STAKE, shares, "open", model))
                 added += 1
         c.commit()
-    print(f"tick: recorded {added} new paper copies across {len(WALLETS)} wallets")
+    print(f"tick: recorded {added} new paper copies (x2 models) across {len(WALLETS)} wallets")
 
 
 def _market_by_condition(cid):
@@ -132,17 +141,18 @@ def _market_by_condition(cid):
 
 def resolve():
     c = db()
-    # oldest-open first (likeliest resolved); bounded per run + wall-clock deadline so a
-    # slow gamma API can never make this run long enough to blow the job timeout.
-    rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry FROM copies "
-                     "WHERE status='open' ORDER BY their_ts ASC LIMIT 100").fetchall()
+    # newest-open prioritized for Model B (exit needs frequent price checks); bounded by
+    # row count + wall-clock so a slow gamma API can't blow the job timeout.
+    rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry,"
+                     "COALESCE(model,'hold'),copied_ts FROM copies "
+                     "WHERE status='open' ORDER BY id DESC LIMIT 150").fetchall()
     deadline = time.time() + 300
-    settled = marked = 0
-    for cid_row in rows:
+    now = time.time()
+    settled = marked = exited = 0
+    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts in rows:
         if time.time() > deadline:
             print("resolve: hit 5-min deadline, stopping early (rest next run)")
             break
-        cid_id, cid, oidx, shares, stake, entry = cid_row
         m = _market_by_condition(cid)
         if not m:
             continue
@@ -151,70 +161,81 @@ def resolve():
         except Exception:
             continue
         oidx = oidx if oidx is not None else 0
-        if m.get("closed"):
+        cur = prices[oidx] if oidx < len(prices) else entry
+        if m.get("closed"):                       # market resolved -> settle either model
             win_idx = max(range(len(prices)), key=lambda i: prices[i])
             won = (win_idx == oidx) and prices[win_idx] > 0.5
             payout = shares if won else 0.0
             c.execute("UPDATE copies SET status=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
                       ("won" if won else "lost", 1.0 if won else 0.0, payout - stake, now_iso(), cid_id))
             settled += 1
-        else:
-            cur = prices[oidx] if oidx < len(prices) else entry
+        elif model == "exit":                     # Model B: take-profit / timeout exit
+            gain = (cur - entry) / entry if entry > 0 else 0
+            try:
+                age_h = (now - datetime.fromisoformat(copied_ts).timestamp()) / 3600
+            except Exception:
+                age_h = 0
+            if gain >= TAKE_PROFIT:
+                c.execute("UPDATE copies SET status='exit_won',mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (cur, shares * cur - stake, now_iso(), cid_id)); exited += 1
+            elif age_h >= MAX_HOLD_HOURS:
+                c.execute("UPDATE copies SET status='exit_closed',mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (cur, shares * cur - stake, now_iso(), cid_id)); exited += 1
+            else:
+                c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
+                          (cur, shares * cur - stake, cid_id)); marked += 1
+        else:                                     # Model A: hold, just mark-to-market
             c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
-                      (cur, shares * cur - stake, cid_id))
-            marked += 1
+                      (cur, shares * cur - stake, cid_id)); marked += 1
     c.commit()
-    print(f"resolve: settled {settled}, marked-to-market {marked} open")
+    print(f"resolve: settled {settled}, Model-B exits {exited}, marked {marked}")
+
+
+CLOSED = ("won", "lost", "exit_won", "exit_closed")
+
+
+def _model_block(label, rows, note):
+    # rows: (status, stake, pnl)
+    closed = [r for r in rows if r[0] in CLOSED]
+    open_ = [r for r in rows if r[0] == "open"]
+    wins = [r for r in closed if r[2] and r[2] > 0]
+    real = sum(r[2] or 0 for r in closed)
+    unreal = sum(r[2] or 0 for r in open_)
+    staked = sum(r[1] for r in closed)
+    print(f"  -- {label} --   {note}")
+    print(f"     copies: {len(rows)}   closed: {len(closed)}   open: {len(open_)}")
+    if closed:
+        wr = len(wins) / len(closed) * 100
+        print(f"     win rate:   {wr:.0f}%  ({len(wins)}/{len(closed)})")
+        print(f"     realized:   ${real:+.2f}" + (f"   ROI {real/staked*100:+.1f}%" if staked else ""))
+    print(f"     open (mark-to-market): ${unreal:+.2f}")
 
 
 def report():
     c = db()
-    rows = c.execute("SELECT wallet,status,stake,pnl,mark_price FROM copies").fetchall()
-    print("\n" + "=" * 66)
-    print("  POLYMARKET COPYBOT — paper forward-test ($10/copy)")
-    print("=" * 66)
+    rows = c.execute("SELECT COALESCE(model,'hold'),status,stake,pnl FROM copies").fetchall()
+    print("\n" + "=" * 64)
+    print("  POLYMARKET COPYBOT — two parallel models ($10/copy)")
+    print("=" * 64)
     if not rows:
         print("  no copies yet — run tick.\n"); return
-    settled = [r for r in rows if r[1] in ("won", "lost")]
-    open_ = [r for r in rows if r[1] == "open"]
-    by = {}
-    for w, st, stake, pnl, mark in rows:
-        d = by.setdefault(w, {"n": 0, "real": 0.0, "unreal": 0.0, "settled": 0, "wins": 0})
-        d["n"] += 1
-        if st in ("won", "lost"):
-            d["settled"] += 1
-            d["real"] += pnl or 0
-            d["wins"] += 1 if st == "won" else 0
-        elif pnl is not None:
-            d["unreal"] += pnl
-    print(f"  copies: {len(rows)}   settled: {len(settled)}   open: {len(open_)}")
-    print(f"  {'wallet':<14}{'copies':>7}{'settled':>8}{'realized':>11}{'unreal(MTM)':>13}")
-    print("  " + "-" * 60)
-    tot_real = tot_unreal = 0.0
-    for w, d in sorted(by.items(), key=lambda x: -(x[1]["real"] + x[1]["unreal"])):
-        tot_real += d["real"]; tot_unreal += d["unreal"]
-        print(f"  {w:<14}{d['n']:>7}{d['settled']:>8}{('$%+.2f' % d['real']):>11}{('$%+.2f' % d['unreal']):>13}")
-    print("  " + "-" * 60)
-    print(f"  {'TOTAL':<14}{len(rows):>7}{len(settled):>8}{('$%+.2f' % tot_real):>11}{('$%+.2f' % tot_unreal):>13}")
-    staked_settled = sum(r[2] for r in settled)
-    if staked_settled:
-        print(f"\n  realized ROI (resolved only): {tot_real/staked_settled*100:+.1f}%  "
-              f"({sum(1 for r in settled if r[1]=='won')}/{len(settled)} won)")
-    # how late do we SEE their trades? (detection lag = when-we-copied minus when-they-traded)
+    hold = [(r[1], r[2], r[3]) for r in rows if r[0] == "hold"]
+    exit_ = [(r[1], r[2], r[3]) for r in rows if r[0] == "exit"]
+    _model_block("MODEL A: copy & HOLD to resolution", hold, "(slow — markets resolve weeks out)")
+    print()
+    _model_block("MODEL B: copy & SELL at +%d%% / %dh cap" % (TAKE_PROFIT * 100, MAX_HOLD_HOURS),
+                 exit_, "(fast — closes in 1-3 days)")
+    # detection lag
     lags = []
     for ct, tt in c.execute("SELECT copied_ts, their_ts FROM copies WHERE their_ts IS NOT NULL"):
         try:
-            cu = datetime.fromisoformat(ct).timestamp()
-            lags.append(cu - int(tt))
+            lags.append(datetime.fromisoformat(ct).timestamp() - int(tt))
         except Exception:
             pass
     if lags:
         lags.sort()
-        med = lags[len(lags)//2] / 60
-        fast = lags[0] / 60
-        print(f"\n  DETECTION LAG (how late we catch their trades): median {med:.1f} min, "
-              f"fastest {fast:.1f} min  (over {len(lags)} trades)")
-    print("  note: most copies stay OPEN (slow markets); unreal(MTM) = current mark, not final.\n")
+        print(f"\n  detection lag: median {lags[len(lags)//2]/60:.1f} min over {len(lags)} trades")
+    print("=" * 64 + "\n")
 
 
 if __name__ == "__main__":
