@@ -33,9 +33,8 @@ DB = Path(__file__).parent / "copybot.db"
 # REAL $20 wallet per model: each model starts with $20, bets $2/trade (so up to ~10
 # positions at once), and can only open a copy if it has free cash. When a position
 # closes, the proceeds return to the wallet to be reused (recycling).
-BANKROLL_PER_MODEL = 20.0
-STAKE = 1.0                  # $1 per copy -> $20 spreads across all 20 traders, a fraction each
-MAX_OPEN_PER_TRADER = 1      # at most 1 open position per trader per model (even spread)
+BANKROLL_PER_MODEL = 20.0    # EACH TRADER gets their OWN $20 per model -> rank which trader wins
+STAKE = 2.0                  # $2 per copy -> ~10 positions per trader within their own $20
 # Model B (take-profit exit): sell our copy when it's up enough to bank a margin, or
 # force-close after MAX_HOLD so positions turn over fast (-> 1-3 day verdict, not weeks).
 TAKE_PROFIT = 0.15        # exit when the position is +15% (enough margin to profit)
@@ -107,19 +106,23 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS decisions(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, copy_id INTEGER, wallet TEXT,
         title TEXT, entry REAL, current REAL, gain REAL, decision TEXT, why TEXT)""")
-    c.execute("CREATE TABLE IF NOT EXISTS bankroll(model TEXT PRIMARY KEY, cash REAL)")
-    for m in ("hold", "exit", "cdecide"):
-        c.execute("INSERT OR IGNORE INTO bankroll(model,cash) VALUES(?,?)", (m, BANKROLL_PER_MODEL))
+    c.execute("""CREATE TABLE IF NOT EXISTS bankroll(
+        model TEXT, trader TEXT, cash REAL, PRIMARY KEY(model,trader))""")
     return c
 
 
-def _cash(c, model):
-    r = c.execute("SELECT cash FROM bankroll WHERE model=?", (model,)).fetchone()
-    return r[0] if r else 0.0
+def _cash(c, model, trader):
+    """Each (model, trader) is its own $20 wallet. Lazily initialised on first use."""
+    r = c.execute("SELECT cash FROM bankroll WHERE model=? AND trader=?", (model, trader)).fetchone()
+    if r is None:
+        c.execute("INSERT OR IGNORE INTO bankroll(model,trader,cash) VALUES(?,?,?)",
+                  (model, trader, BANKROLL_PER_MODEL))
+        return BANKROLL_PER_MODEL
+    return r[0]
 
 
-def _credit(c, model, amount):
-    c.execute("UPDATE bankroll SET cash=cash+? WHERE model=?", (amount, model))
+def _credit(c, model, trader, amount):
+    c.execute("UPDATE bankroll SET cash=cash+? WHERE model=? AND trader=?", (amount, model, trader))
 
 
 _endcache = {}
@@ -188,11 +191,7 @@ def tick():
                 key = f"{base}:{model}"
                 if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
                     continue
-                # even spread: at most 1 open position per trader per model
-                if c.execute("SELECT COUNT(*) FROM copies WHERE model=? AND wallet=? AND status='open'",
-                             (model, name)).fetchone()[0] >= MAX_OPEN_PER_TRADER:
-                    continue
-                if _cash(c, model) < STAKE:     # wallet's out of cash -> can't copy (realistic)
+                if _cash(c, model, name) < STAKE:   # this trader's OWN $20 wallet for this model
                     continue
                 c.execute("""INSERT OR IGNORE INTO copies(key,copied_ts,wallet,their_ts,condition_id,
                     asset,title,outcome,outcome_index,their_price,entry,stake,shares,status,model)
@@ -200,7 +199,7 @@ def tick():
                     (key, now_iso(), name, a.get("timestamp"), a.get("conditionId"), asset,
                      (a.get("title") or "")[:80], a.get("outcome"), a.get("outcomeIndex"),
                      their_price, entry, STAKE, shares, "open", model))
-                _credit(c, model, -STAKE)       # lock the stake out of the wallet
+                _credit(c, model, name, -STAKE)     # lock stake out of THIS trader's wallet
                 added += 1
         c.commit()
     print(f"tick: recorded {added} new paper copies (x2 models) across {len(WALLETS)} wallets")
@@ -221,12 +220,12 @@ def resolve():
     # newest-open prioritized for Model B (exit needs frequent price checks); bounded by
     # row count + wall-clock so a slow gamma API can't blow the job timeout.
     rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry,"
-                     "COALESCE(model,'hold'),copied_ts FROM copies "
+                     "COALESCE(model,'hold'),copied_ts,wallet FROM copies "
                      "WHERE status='open' ORDER BY id DESC LIMIT 150").fetchall()
     deadline = time.time() + 300
     now = time.time()
     settled = marked = exited = 0
-    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts in rows:
+    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet in rows:
         if time.time() > deadline:
             print("resolve: hit 5-min deadline, stopping early (rest next run)")
             break
@@ -245,7 +244,7 @@ def resolve():
             payout = shares if won else 0.0
             c.execute("UPDATE copies SET status=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
                       ("won" if won else "lost", 1.0 if won else 0.0, payout - stake, now_iso(), cid_id))
-            _credit(c, model, payout)             # proceeds back to the wallet
+            _credit(c, model, wallet, payout)     # proceeds back to this trader's wallet
             settled += 1
         elif model == "exit":                     # Model B: take-profit / timeout exit
             gain = (cur - entry) / entry if entry > 0 else 0
@@ -255,10 +254,10 @@ def resolve():
                 age_h = 0
             if gain >= TAKE_PROFIT:
                 c.execute("UPDATE copies SET status='exit_won',mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
-                          (cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "exit", shares * cur); exited += 1
+                          (cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "exit", wallet, shares * cur); exited += 1
             elif age_h >= MAX_HOLD_HOURS:
                 c.execute("UPDATE copies SET status='exit_closed',mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
-                          (cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "exit", shares * cur); exited += 1
+                          (cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "exit", wallet, shares * cur); exited += 1
             else:
                 c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
                           (cur, shares * cur - stake, cid_id)); marked += 1
@@ -315,7 +314,7 @@ def claude_decide():
         if age_h >= CDECIDE_MAX_HOLD_HOURS:    # backstop force-close
             c.execute("UPDATE copies SET status='c_closed',pnl=?,resolved_ts=?,last_reason=? WHERE id=?",
                       (shares * cur - stake, now_iso(), "auto: 72h cap", cid_id))
-            _credit(c, "cdecide", shares * cur)
+            _credit(c, "cdecide", wallet, shares * cur)
             c.execute("INSERT INTO decisions(ts,copy_id,wallet,title,entry,current,gain,decision,why) "
                       "VALUES(?,?,?,?,?,?,?,?,?)",
                       (now_iso(), cid_id, wallet, title, entry, cur, round(gain, 3), "SELL", "auto: 72h cap"))
@@ -340,58 +339,63 @@ def claude_decide():
         c.execute("UPDATE copies SET last_check=?,last_reason=? WHERE id=?", (now_iso(), why, cid_id))
         if decision == "SELL":
             c.execute("UPDATE copies SET status='c_sold',pnl=?,resolved_ts=? WHERE id=?",
-                      (shares * cur - stake, now_iso(), cid_id)); _credit(c, "cdecide", shares * cur); sold += 1
+                      (shares * cur - stake, now_iso(), cid_id)); _credit(c, "cdecide", wallet, shares * cur); sold += 1
         else:
             held += 1
         c.commit()
     print(f"claude_decide: {calls} calls -> {sold} sold, {held} held, {closed} auto-closed")
 
 
-def _model_summary(c, model):
-    rows = c.execute("SELECT wallet,title,outcome,entry,mark_price,pnl,status,last_reason "
-                     "FROM copies WHERE model=? ORDER BY id DESC LIMIT 100", (model,)).fetchall()
-    positions = []
-    for w, t, o, e, mk, pnl, st, why in rows:
-        gain = ((mk - e) / e * 100) if (mk and e) else 0
-        positions.append(dict(wallet=w, title=(t or "")[:80], outcome=o, entry=e, current=mk,
-                              gain=round(gain, 1), status=st, pnl=round(pnl, 2) if pnl is not None else None,
-                              why=why))
-    allr = c.execute("SELECT status,pnl,stake FROM copies WHERE model=?", (model,)).fetchall()
-    closed = [r for r in allr if r[0] in CLOSED]
-    wins = [r for r in closed if (r[1] or 0) > 0]
-    openr = [r for r in allr if r[0] == "open"]
-    cash = _cash(c, model)
-    at_risk = round(sum(r[2] or 0 for r in openr), 2)
-    unreal = round(sum(r[1] or 0 for r in openr), 2)
-    return dict(open=len(openr), closed=len(closed), wins=len(wins),
-                win_rate=round(len(wins) / len(closed) * 100, 1) if closed else 0,
-                realized=round(sum(r[1] or 0 for r in closed), 2),
-                unreal=unreal,
-                started=BANKROLL_PER_MODEL,
-                cash=round(cash, 2),                                  # free cash in the $20 wallet
-                at_risk=at_risk,                                      # $ tied up in open positions
-                value=round(cash + at_risk + unreal, 2),             # total wallet worth right now
-                churned=round(sum(r[2] or 0 for r in allr), 2),      # total $ volume ever deployed
-                positions=positions[:60])
+CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed")
 
 
 def export():
-    """Write docs/data.json for the live dashboard — all three models A/B/C + C's decisions."""
+    """Write docs/data.json: each trader's OWN $20 wallet under each model (A/B/C),
+    a trader leaderboard (who's worth copying), model aggregates, and Claude's decisions."""
     c = db()
-    models = {"A": _model_summary(c, "hold"),
-              "B": _model_summary(c, "exit"),
-              "C": _model_summary(c, "cdecide")}
+    MODELS = [("hold", "A"), ("exit", "B"), ("cdecide", "C")]
+    agg = {}   # (model, trader) -> stats
+    for model, wallet, status, pnl, stake in c.execute(
+            "SELECT model,wallet,status,COALESCE(pnl,0),stake FROM copies"):
+        d = agg.setdefault((model, wallet),
+                           {"realized": 0.0, "unreal": 0.0, "at_risk": 0.0, "open": 0, "closed": 0, "wins": 0})
+        if status in CLOSED:
+            d["closed"] += 1; d["realized"] += pnl
+            if pnl > 0:
+                d["wins"] += 1
+        elif status == "open":
+            d["open"] += 1; d["unreal"] += pnl; d["at_risk"] += stake
+    cash = {(m, t): v for m, t, v in c.execute("SELECT model,trader,cash FROM bankroll")}
+
+    traders = []
+    for t in sorted(WALLETS.keys()):
+        row = {"name": t}
+        for mk, mn in MODELS:
+            d = agg.get((mk, t), {"realized": 0, "unreal": 0, "at_risk": 0, "open": 0, "closed": 0, "wins": 0})
+            ch = cash.get((mk, t), BANKROLL_PER_MODEL)
+            row[mn] = dict(value=round(ch + d["at_risk"] + d["unreal"], 2),
+                           realized=round(d["realized"], 2), open=d["open"], closed=d["closed"],
+                           win_rate=round(d["wins"] / d["closed"] * 100) if d["closed"] else 0)
+        row["best"] = round(max(row["A"]["value"], row["B"]["value"], row["C"]["value"]), 2)
+        traders.append(row)
+    traders.sort(key=lambda r: -r["best"])
+
+    models = {}
+    for mk, mn in MODELS:
+        models[mn] = dict(started=round(BANKROLL_PER_MODEL * len(WALLETS), 2),
+                          value=round(sum(r[mn]["value"] for r in traders), 2),
+                          realized=round(sum(r[mn]["realized"] for r in traders), 2),
+                          open=sum(r[mn]["open"] for r in traders),
+                          closed=sum(r[mn]["closed"] for r in traders))
     decs = c.execute("SELECT ts,wallet,title,entry,current,gain,decision,why FROM decisions "
-                     "ORDER BY id DESC LIMIT 200").fetchall()
+                     "ORDER BY id DESC LIMIT 150").fetchall()
     decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], entry=d[3],
                       current=d[4], gain=round((d[5] or 0) * 100, 1), decision=d[6], why=d[7]) for d in decs]
     os.makedirs("docs", exist_ok=True)
-    out = dict(updated=now_iso(), models=models, decisions=decisions)
-    json.dump(out, open("docs/data.json", "w"))
-    print("export: wrote docs/data.json ->", {k: (v["closed"], v["realized"]) for k, v in models.items()})
-
-
-CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed")
+    json.dump(dict(updated=now_iso(), models=models, traders=traders, decisions=decisions),
+              open("docs/data.json", "w"))
+    print("export: traders=%d, model totals:" % len(traders),
+          {mn: models[mn]["value"] for _, mn in MODELS})
 
 
 def _model_block(label, rows, note):

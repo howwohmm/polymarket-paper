@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>copytrader — a/b/c models</title>
+<title>copytrader — trader & model scoreboard</title>
 <link rel="preconnect" href="https://api.fontshare.com">
 <link href="https://api.fontshare.com/v2/css?f[]=manrope@300,400,500&display=swap" rel="stylesheet">
 <style>
@@ -17,101 +17,84 @@
   .sub{ color:var(--dim); font-size:12.5px; margin-top:4px }
   .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--green);
         margin-right:7px; animation:p 2s infinite } @keyframes p{ 50%{ opacity:.3 } }
-  .board{ display:flex; gap:12px; flex-wrap:wrap; margin:26px 0 }
-  .m{ flex:1; min-width:220px; background:var(--panel); border:1px solid var(--line);
-      border-radius:16px; padding:18px 20px }
+  .board{ display:flex; gap:12px; flex-wrap:wrap; margin:24px 0 }
+  .m{ flex:1; min-width:200px; background:var(--panel); border:1px solid var(--line);
+      border-radius:16px; padding:16px 18px }
   .m h3{ font-weight:400; font-size:13px; color:var(--dim) } .m h3 b{ color:var(--txt); font-weight:500 }
-  .m .pnl{ font-size:30px; font-weight:400; margin:10px 0 2px } .m .pl{ font-size:11px; color:var(--dim) }
-  .m .grid{ display:flex; gap:18px; margin-top:14px; font-size:12.5px }
-  .m .grid div span{ display:block; color:var(--dim); font-size:11px }
+  .m .pnl{ font-size:27px; font-weight:400; margin:8px 0 2px } .m .pl{ font-size:11.5px; color:var(--dim) }
   .sec{ font-size:12.5px; color:var(--dim); letter-spacing:.5px; margin:32px 0 12px;
         border-bottom:1px solid var(--line); padding-bottom:8px }
-  .tabs{ display:flex; gap:8px; margin:18px 0 12px }
-  .tab{ background:var(--panel); border:1px solid var(--line); color:var(--dim); border-radius:20px;
-        padding:6px 16px; font-size:12.5px; cursor:pointer; font-family:inherit }
-  .tab.on{ color:var(--txt); border-color:#5a5a5a }
+  table{ width:100%; border-collapse:collapse; font-size:13px }
+  th{ text-align:left; color:var(--dim); font-weight:400; font-size:11px; padding:9px 10px; border-bottom:1px solid var(--line) }
+  td{ padding:10px; border-bottom:1px solid var(--line) } tr:last-child td{ border-bottom:none }
+  th.r,td.r{ text-align:right }
+  .rank{ color:var(--dim); width:26px } .nm{ font-weight:400 }
+  .cell b{ font-weight:400 } .cell span{ display:block; font-size:10.5px; color:var(--dim) }
+  .pos{ color:var(--green) } .neg{ color:var(--red) } .flat{ color:var(--dim) }
+  .win{ outline:1px solid rgba(127,207,159,.4); border-radius:6px }
   .feed{ display:flex; flex-direction:column; gap:8px }
   .card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 15px }
-  .card .top{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start }
-  .mkt{ font-size:13.5px; font-weight:400; flex:1 } .when{ color:var(--dim); font-size:11px; white-space:nowrap }
+  .card .top{ display:flex; justify-content:space-between; gap:10px } .mkt{ font-size:13.5px; flex:1 }
+  .when{ color:var(--dim); font-size:11px; white-space:nowrap }
   .why{ color:var(--dim); font-size:12.5px; margin-top:6px; font-style:italic }
   .meta{ font-size:12px; color:var(--dim); margin-top:5px }
-  .badge{ font-size:10.5px; padding:2px 9px; border-radius:20px; font-weight:500; margin-left:6px }
-  .SELL{ background:rgba(224,143,143,.15); color:var(--red) }
-  .HOLD{ background:rgba(143,184,224,.15); color:var(--hold) }
-  .pos{ color:var(--green) } .neg{ color:var(--red) }
-  table{ width:100%; border-collapse:collapse; font-size:12.5px }
-  th{ text-align:left; color:var(--dim); font-weight:400; font-size:11px; padding:8px 10px; border-bottom:1px solid var(--line) }
-  td{ padding:9px 10px; border-bottom:1px solid var(--line) } tr:last-child td{ border-bottom:none }
-  .tag{ color:var(--dim); font-size:11px }
+  .badge{ font-size:10.5px; padding:2px 9px; border-radius:20px; margin-left:6px }
+  .SELL{ background:rgba(224,143,143,.15); color:var(--red) } .HOLD{ background:rgba(143,184,224,.15); color:var(--hold) }
 </style>
 </head>
 <body>
-  <h1><span class="dot"></span>polymarket copytrader — 3 models</h1>
+  <h1><span class="dot"></span>polymarket copytrader</h1>
   <div class="sub" id="sub">loading…</div>
 
-  <div class="sec">scoreboard — which exit strategy wins</div>
+  <div class="sec">model totals — which exit strategy wins (each = 20 traders × $20)</div>
   <div class="board" id="board"></div>
+
+  <div class="sec">trader leaderboard — who's worth copying (each trader has their own $20 per model)</div>
+  <div id="lb"></div>
 
   <div class="sec">claude's decisions — every move &amp; why (model c)</div>
   <div class="feed" id="feed"></div>
 
-  <div class="sec">positions</div>
-  <div class="tabs" id="tabs"></div>
-  <div id="postable"></div>
-
 <script>
-const J = n => (n==null?'—':(n>=0?'+':'−')+'$'+Math.abs(n).toFixed(2));
-const cls = n => (n>=0?'pos':'neg');
+const money = v => '$'+(v??0).toFixed(2);
+const cell = v => { const c = v>20.05?'pos':v<19.95?'neg':'flat';
+  return `<td class="r cell"><b class="${c}">${money(v)}</b></td>`; };
 const ago = ts => { const s=(Date.now()-new Date(ts).getTime())/1000;
   if(s<90)return Math.round(s)+'s ago'; if(s<5400)return Math.round(s/60)+'m ago';
   if(s<129600)return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago'; };
-const NAMES = {A:'A · copy &amp; hold', B:'B · sell at +15%', C:'C · claude decides'};
-let DATA=null, tab='C';
+const NAMES={A:'A · hold',B:'B · sell +15%',C:'C · claude'};
 
 async function load(){
-  try{ DATA = await (await fetch('./data.json?'+Date.now())).json(); }
-  catch(e){ document.getElementById('sub').textContent='no data yet — bot is warming up'; return; }
-  const d=DATA;
+  let d; try{ d=await (await fetch('./data.json?'+Date.now())).json(); }
+  catch(e){ document.getElementById('sub').textContent='no data yet — bot warming up'; return; }
   document.getElementById('sub').textContent =
-    `updated ${ago(d.updated)} · auto-refreshes 60s · $20 wallet/model · $1 per copy · 20 traders`;
+    `updated ${ago(d.updated)} · auto-refresh 60s · each trader gets own $20/model · $2 per copy`;
 
-  document.getElementById('board').innerHTML = ['A','B','C'].map(k=>{ const m=d.models[k];
+  document.getElementById('board').innerHTML = ['A','B','C'].map(k=>{ const m=d.models[k]; const dv=m.value-m.started;
     return `<div class="m"><h3>${NAMES[k]}</h3>
-      <div class="pnl ${m.value>=m.started?'pos':'neg'}">$${(m.value??m.started).toFixed(2)}</div>
-      <div class="pl">wallet value · started $${(m.started||20).toFixed(0)} (${m.value-m.started>=0?'+':'−'}$${Math.abs(m.value-m.started).toFixed(2)})</div>
-      <div class="grid">
-        <div><b>$${(m.cash??0).toFixed(2)}</b><span>free cash</span></div>
-        <div><b>$${(m.at_risk??0).toFixed(2)}</b><span>in trades</span></div>
-        <div><b>${m.open}</b><span>open</span></div>
-        <div><b>${m.win_rate}%</b><span>win rate</span></div>
-      </div>
-      <div class="pl" style="margin-top:10px">${m.closed} closed · $${(m.churned||0).toLocaleString()} total volume churned</div></div>`; }).join('');
+      <div class="pnl ${dv>=0?'pos':'neg'}">${money(m.value)}</div>
+      <div class="pl">started ${money(m.started)} (${dv>=0?'+':'−'}${money(Math.abs(dv))}) · ${m.closed} closed · ${m.open} open</div>
+      </div>`; }).join('');
 
-  document.getElementById('feed').innerHTML = (d.decisions||[]).slice(0,40).map(x=>`
-    <div class="card"><div class="top">
-      <div class="mkt">${x.title} <span class="tag">· ${x.outcome||''}</span></div>
-      <span class="when">${ago(x.ts)}</span></div>
-      <div class="meta">${x.wallet} · ${x.entry?.toFixed(2)} → ${x.current?.toFixed(2)}
-        <span class="${cls(x.gain)}">(${x.gain>=0?'+':''}${x.gain}%)</span>
+  const T=d.traders||[];
+  document.getElementById('lb').innerHTML = `<table>
+    <tr><th class="rank"></th><th>trader</th>
+        <th class="r">A · hold</th><th class="r">B · sell +15%</th><th class="r">C · claude</th><th class="r">best</th></tr>
+    ${T.map((t,i)=>{ const best=Math.max(t.A.value,t.B.value,t.C.value);
+      const c=(m,v)=>`<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b><span>${t[m].closed} closed</span></td>`;
+      return `<tr><td class="rank">${i+1}</td><td class="nm">${t.name}</td>
+        ${c('A',t.A.value)}${c('B',t.B.value)}${c('C',t.C.value)}
+        <td class="r"><b class="${best>20.05?'pos':best<19.95?'neg':'flat'}">${money(best)}</b></td></tr>`; }).join('')}
+  </table>`;
+
+  document.getElementById('feed').innerHTML = (d.decisions||[]).slice(0,30).map(x=>`
+    <div class="card"><div class="top"><div class="mkt">${x.title}</div><span class="when">${ago(x.ts)}</span></div>
+      <div class="meta">${x.wallet} · ${x.entry?.toFixed(2)}→${x.current?.toFixed(2)}
+        <span class="${x.gain>=0?'pos':'neg'}">(${x.gain>=0?'+':''}${x.gain}%)</span>
         <span class="badge ${x.decision}">${x.decision}</span></div>
       <div class="why">“${x.why||''}”</div></div>`).join('')
     || '<div class="card">no decisions yet — claude acts once positions move ±5–10%</div>';
-
-  renderTabs(); renderPositions();
 }
-function renderTabs(){ document.getElementById('tabs').innerHTML = ['A','B','C'].map(k=>
-  `<button class="tab ${k===tab?'on':''}" onclick="tab='${k}';renderTabs();renderPositions()">${NAMES[k]}</button>`).join(''); }
-function renderPositions(){ const m=DATA.models[tab];
-  const open=(m.positions||[]).filter(p=>p.status==='open').slice(0,60);
-  document.getElementById('postable').innerHTML = `<table>
-    <tr><th>trader</th><th>market</th><th>entry→now</th><th>gain</th>${tab==='C'?'<th>claude note</th>':''}</tr>
-    ${open.map(p=>`<tr><td>${p.wallet}</td><td>${p.title}</td>
-      <td>${p.entry?.toFixed(2)} → ${p.current?p.current.toFixed(2):'—'}</td>
-      <td class="${cls(p.gain)}">${p.gain>=0?'+':''}${p.gain}%</td>
-      ${tab==='C'?`<td class="tag">${p.why||'—'}</td>`:''}</tr>`).join('') ||
-      `<tr><td colspan="5" class="tag">no open positions</td></tr>`}
-  </table>`; }
 load(); setInterval(load, 60000);
 </script>
 </body>
