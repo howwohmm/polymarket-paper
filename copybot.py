@@ -347,10 +347,10 @@ def export():
     models = {"A": _model_summary(c, "hold"),
               "B": _model_summary(c, "exit"),
               "C": _model_summary(c, "cdecide")}
-    decs = c.execute("SELECT ts,wallet,title,outcome,entry,current,gain,decision,why FROM decisions "
+    decs = c.execute("SELECT ts,wallet,title,entry,current,gain,decision,why FROM decisions "
                      "ORDER BY id DESC LIMIT 200").fetchall()
-    decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], outcome=d[3], entry=d[4],
-                      current=d[5], gain=round((d[6] or 0) * 100, 1), decision=d[7], why=d[8]) for d in decs]
+    decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], entry=d[3],
+                      current=d[4], gain=round((d[5] or 0) * 100, 1), decision=d[6], why=d[7]) for d in decs]
     os.makedirs("docs", exist_ok=True)
     out = dict(updated=now_iso(), models=models, decisions=decisions)
     json.dump(out, open("docs/data.json", "w"))
