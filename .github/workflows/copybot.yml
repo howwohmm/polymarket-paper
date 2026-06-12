@@ -1,0 +1,41 @@
+name: copybot-tick
+
+# Forward-tests copying vetted traders. tick (detect fresh buys) is fast; resolve
+# (settle/mark) is bounded per run. Self-healing — missed runs lose nothing.
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly, off-peak minute
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: copybot
+  cancel-in-progress: false
+
+jobs:
+  copybot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: tick + resolve + report
+        run: |
+          python3 copybot.py tick
+          python3 copybot.py resolve
+          python3 copybot.py report
+      - name: persist
+        run: |
+          git config user.name "copybot"
+          git config user.email "bot@users.noreply.github.com"
+          git add copybot.db
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "copybot tick $(date -u +%FT%TZ)"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
