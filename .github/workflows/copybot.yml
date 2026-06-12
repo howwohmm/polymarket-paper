@@ -36,7 +36,7 @@ jobs:
             python3 copybot.py export || true
             git add copybot.db docs/data.json
             git diff --staged --quiet || { git commit -m "copybot $(date -u +%FT%TZ)"; \
-              for a in 1 2 3; do git pull --rebase --autostash origin main || true; git push && break || sleep 5; done; }
+              for a in 1 2 3; do git pull --rebase --autostash origin main || true; git push origin HEAD:main && break || sleep 5; done; }
           }
           for i in $(seq 1 12); do
             echo "--- tick $i/12 ($(date -u +%T)) ---"
