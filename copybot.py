@@ -30,7 +30,11 @@ from pathlib import Path
 DATA = "https://data-api.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 DB = Path(__file__).parent / "copybot.db"
-STAKE = 10.0
+# REAL $20 wallet per model: each model starts with $20, bets $2/trade (so up to ~10
+# positions at once), and can only open a copy if it has free cash. When a position
+# closes, the proceeds return to the wallet to be reused (recycling).
+BANKROLL_PER_MODEL = 20.0
+STAKE = 2.0
 # Model B (take-profit exit): sell our copy when it's up enough to bank a margin, or
 # force-close after MAX_HOLD so positions turn over fast (-> 1-3 day verdict, not weeks).
 TAKE_PROFIT = 0.15        # exit when the position is +15% (enough margin to profit)
@@ -102,7 +106,19 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS decisions(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, copy_id INTEGER, wallet TEXT,
         title TEXT, entry REAL, current REAL, gain REAL, decision TEXT, why TEXT)""")
+    c.execute("CREATE TABLE IF NOT EXISTS bankroll(model TEXT PRIMARY KEY, cash REAL)")
+    for m in ("hold", "exit", "cdecide"):
+        c.execute("INSERT OR IGNORE INTO bankroll(model,cash) VALUES(?,?)", (m, BANKROLL_PER_MODEL))
     return c
+
+
+def _cash(c, model):
+    r = c.execute("SELECT cash FROM bankroll WHERE model=?", (model,)).fetchone()
+    return r[0] if r else 0.0
+
+
+def _credit(c, model, amount):
+    c.execute("UPDATE bankroll SET cash=cash+? WHERE model=?", (amount, model))
 
 
 _endcache = {}
@@ -171,12 +187,15 @@ def tick():
                 key = f"{base}:{model}"
                 if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
                     continue
+                if _cash(c, model) < STAKE:     # wallet's out of cash -> can't copy (realistic)
+                    continue
                 c.execute("""INSERT OR IGNORE INTO copies(key,copied_ts,wallet,their_ts,condition_id,
                     asset,title,outcome,outcome_index,their_price,entry,stake,shares,status,model)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (key, now_iso(), name, a.get("timestamp"), a.get("conditionId"), asset,
                      (a.get("title") or "")[:80], a.get("outcome"), a.get("outcomeIndex"),
                      their_price, entry, STAKE, shares, "open", model))
+                _credit(c, model, -STAKE)       # lock the stake out of the wallet
                 added += 1
         c.commit()
     print(f"tick: recorded {added} new paper copies (x2 models) across {len(WALLETS)} wallets")
@@ -221,6 +240,7 @@ def resolve():
             payout = shares if won else 0.0
             c.execute("UPDATE copies SET status=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
                       ("won" if won else "lost", 1.0 if won else 0.0, payout - stake, now_iso(), cid_id))
+            _credit(c, model, payout)             # proceeds back to the wallet
             settled += 1
         elif model == "exit":                     # Model B: take-profit / timeout exit
             gain = (cur - entry) / entry if entry > 0 else 0
@@ -230,10 +250,10 @@ def resolve():
                 age_h = 0
             if gain >= TAKE_PROFIT:
                 c.execute("UPDATE copies SET status='exit_won',mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
-                          (cur, shares * cur - stake, now_iso(), cid_id)); exited += 1
+                          (cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "exit", shares * cur); exited += 1
             elif age_h >= MAX_HOLD_HOURS:
                 c.execute("UPDATE copies SET status='exit_closed',mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
-                          (cur, shares * cur - stake, now_iso(), cid_id)); exited += 1
+                          (cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "exit", shares * cur); exited += 1
             else:
                 c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
                           (cur, shares * cur - stake, cid_id)); marked += 1
@@ -290,6 +310,7 @@ def claude_decide():
         if age_h >= CDECIDE_MAX_HOLD_HOURS:    # backstop force-close
             c.execute("UPDATE copies SET status='c_closed',pnl=?,resolved_ts=?,last_reason=? WHERE id=?",
                       (shares * cur - stake, now_iso(), "auto: 72h cap", cid_id))
+            _credit(c, "cdecide", shares * cur)
             c.execute("INSERT INTO decisions(ts,copy_id,wallet,title,entry,current,gain,decision,why) "
                       "VALUES(?,?,?,?,?,?,?,?,?)",
                       (now_iso(), cid_id, wallet, title, entry, cur, round(gain, 3), "SELL", "auto: 72h cap"))
@@ -314,7 +335,7 @@ def claude_decide():
         c.execute("UPDATE copies SET last_check=?,last_reason=? WHERE id=?", (now_iso(), why, cid_id))
         if decision == "SELL":
             c.execute("UPDATE copies SET status='c_sold',pnl=?,resolved_ts=? WHERE id=?",
-                      (shares * cur - stake, now_iso(), cid_id)); sold += 1
+                      (shares * cur - stake, now_iso(), cid_id)); _credit(c, "cdecide", shares * cur); sold += 1
         else:
             held += 1
         c.commit()
@@ -334,12 +355,18 @@ def _model_summary(c, model):
     closed = [r for r in allr if r[0] in CLOSED]
     wins = [r for r in closed if (r[1] or 0) > 0]
     openr = [r for r in allr if r[0] == "open"]
+    cash = _cash(c, model)
+    at_risk = round(sum(r[2] or 0 for r in openr), 2)
+    unreal = round(sum(r[1] or 0 for r in openr), 2)
     return dict(open=len(openr), closed=len(closed), wins=len(wins),
                 win_rate=round(len(wins) / len(closed) * 100, 1) if closed else 0,
                 realized=round(sum(r[1] or 0 for r in closed), 2),
-                unreal=round(sum(r[1] or 0 for r in openr), 2),
-                invested=round(sum(r[2] or 0 for r in allr), 2),     # total $ deployed (all copies)
-                at_risk=round(sum(r[2] or 0 for r in openr), 2),     # $ in still-open positions
+                unreal=unreal,
+                started=BANKROLL_PER_MODEL,
+                cash=round(cash, 2),                                  # free cash in the $20 wallet
+                at_risk=at_risk,                                      # $ tied up in open positions
+                value=round(cash + at_risk + unreal, 2),             # total wallet worth right now
+                churned=round(sum(r[2] or 0 for r in allr), 2),      # total $ volume ever deployed
                 positions=positions[:60])
 
 
