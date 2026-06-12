@@ -4,7 +4,8 @@ name: copybot-tick
 # (settle/mark) is bounded per run. Self-healing — missed runs lose nothing.
 on:
   schedule:
-    - cron: "11 * * * *"   # hourly trigger; each run self-loops to tick every 3 min
+    - cron: "11 * * * *"   # two offset triggers so a dropped GitHub run never leaves a
+    - cron: "41 * * * *"   # full-hour gap; concurrency queues them for near-continuous cover
   workflow_dispatch: {}
 
 permissions:
@@ -23,15 +24,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: tick every 3 min for ~55 min, then resolve
+      - name: tick every 3 min for ~45 min, then resolve (headroom for commit)
         run: |
-          for i in $(seq 1 18); do
-            echo "--- tick $i/18 ($(date -u +%T)) ---"
+          for i in $(seq 1 16); do
+            echo "--- tick $i/16 ($(date -u +%T)) ---"
             python3 copybot.py tick || true
-            [ "$i" -lt 18 ] && sleep 180
+            [ "$i" -lt 16 ] && sleep 180
           done
-          python3 copybot.py resolve || true
-          python3 copybot.py report
+          timeout 360 python3 copybot.py resolve || true
+          python3 copybot.py report || true
       - name: persist
         run: |
           git config user.name "copybot"
@@ -41,6 +42,9 @@ jobs:
             echo "no change"
           else
             git commit -m "copybot tick $(date -u +%FT%TZ)"
-            git pull --rebase --autostash origin main || true
-            git push
+            # resilient push: rebase + retry so one flaky push doesn't lose the hour
+            for attempt in 1 2 3; do
+              git pull --rebase --autostash origin main || true
+              git push && break || { echo "push attempt $attempt failed, retrying"; sleep 5; }
+            done
           fi

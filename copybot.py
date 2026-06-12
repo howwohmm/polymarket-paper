@@ -40,6 +40,8 @@ WALLETS = {
     "RN1":           "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
     "domahhh":       "0x9d84ce0306f8551e02efef1680475fc0f1dc1344",
     "aenews2":       "0x44c1dfe43260c94ed4f1d00de2e1f80fb113ebc1",
+    "gopfan2":       "0xf2f6af4f27ec2dcf4072095ab804016e14cd5817",
+    "HolyMoses7":    "0xa4b366ad22fc0d06f1e934ff468e8922431a87b8",  # lottery acct ($1->$1M goal)
 }
 
 
@@ -118,11 +120,16 @@ def _market_by_condition(cid):
 
 def resolve():
     c = db()
-    # oldest-open first (likeliest resolved); bounded per run to keep cloud runtime sane
+    # oldest-open first (likeliest resolved); bounded per run + wall-clock deadline so a
+    # slow gamma API can never make this run long enough to blow the job timeout.
     rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry FROM copies "
-                     "WHERE status='open' ORDER BY their_ts ASC LIMIT 200").fetchall()
+                     "WHERE status='open' ORDER BY their_ts ASC LIMIT 100").fetchall()
+    deadline = time.time() + 300
     settled = marked = 0
     for cid_row in rows:
+        if time.time() > deadline:
+            print("resolve: hit 5-min deadline, stopping early (rest next run)")
+            break
         cid_id, cid, oidx, shares, stake, entry = cid_row
         m = _market_by_condition(cid)
         if not m:
