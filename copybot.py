@@ -181,6 +181,20 @@ def report():
     if staked_settled:
         print(f"\n  realized ROI (resolved only): {tot_real/staked_settled*100:+.1f}%  "
               f"({sum(1 for r in settled if r[1]=='won')}/{len(settled)} won)")
+    # how late do we SEE their trades? (detection lag = when-we-copied minus when-they-traded)
+    lags = []
+    for ct, tt in c.execute("SELECT copied_ts, their_ts FROM copies WHERE their_ts IS NOT NULL"):
+        try:
+            cu = datetime.fromisoformat(ct).timestamp()
+            lags.append(cu - int(tt))
+        except Exception:
+            pass
+    if lags:
+        lags.sort()
+        med = lags[len(lags)//2] / 60
+        fast = lags[0] / 60
+        print(f"\n  DETECTION LAG (how late we catch their trades): median {med:.1f} min, "
+              f"fastest {fast:.1f} min  (over {len(lags)} trades)")
     print("  note: most copies stay OPEN (slow markets); unreal(MTM) = current mark, not final.\n")
 
 
