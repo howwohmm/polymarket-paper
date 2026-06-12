@@ -19,6 +19,7 @@ Commands:
   python3 copybot.py report    # realized + unrealized copy P&L, per wallet and total
 """
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -37,6 +38,12 @@ MAX_HOLD_HOURS = 36       # if it hasn't hit target in 36h, close it out at curr
 # Model A only: skip copying markets that resolve further out than this (short test —
 # no point holding a copy whose market settles in weeks/months). Model B is exempt.
 MAX_HOLD_RESOLVE_DAYS = 3
+# Model C: Claude decides HOLD/SELL per position (using market + price action), to cut
+# losers smarter than a fixed rule. Bounded so the $500 credit lasts.
+CLAUDE_MODEL = "claude-haiku-4-5"   # cheap; swap to claude-opus-4-6 for smarter, pricier calls
+MAX_CLAUDE_CALLS_PER_RUN = 40       # hard cost cap per workflow run
+CLAUDE_RECHECK_HOURS = 6            # don't re-ask about the same position within 6h
+CDECIDE_MAX_HOLD_HOURS = 72         # backstop: force-close a Claude position after 72h
 
 # vetted copyable traders (small clip, taker, diversified, slow markets)
 WALLETS = {
@@ -87,6 +94,14 @@ def db():
     except Exception:
         pass
     c.execute("CREATE TABLE IF NOT EXISTS market_end(condition_id TEXT PRIMARY KEY, end_date TEXT)")
+    for col in ("last_check TEXT", "last_reason TEXT"):
+        try:
+            c.execute(f"ALTER TABLE copies ADD COLUMN {col}")
+        except Exception:
+            pass
+    c.execute("""CREATE TABLE IF NOT EXISTS decisions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, copy_id INTEGER, wallet TEXT,
+        title TEXT, entry REAL, current REAL, gain REAL, decision TEXT, why TEXT)""")
     return c
 
 
@@ -150,7 +165,7 @@ def tick():
             shares = STAKE / entry
             # Model A only copies markets resolving soon; Model B always copies (exits early)
             hold_ok = _resolves_soon(a.get("conditionId"), c)
-            for model in ("hold", "exit"):   # Model A and Model B, same entry
+            for model in ("hold", "exit", "cdecide"):   # A=hold, B=take-profit, C=Claude
                 if model == "hold" and not hold_ok:
                     continue
                 key = f"{base}:{model}"
@@ -229,7 +244,111 @@ def resolve():
     print(f"resolve: settled {settled}, Model-B exits {exited}, marked {marked}")
 
 
-CLOSED = ("won", "lost", "exit_won", "exit_closed")
+def _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet):
+    """Ask Claude HOLD or SELL for one copied position. Returns (decision, why) or (None, err)."""
+    prompt = (
+        f"You manage a Polymarket COPY position (mirroring trader {wallet}).\n"
+        f'Market: "{title}"\n'
+        f"Bought outcome: {outcome} at {entry:.3f}, now {cur:.3f} ({gain*100:+.1f}%), held {age_h:.0f}h.\n"
+        f"Your job: maximize profit, cut losers early, don't give back gains. "
+        f"Decide whether to HOLD or SELL now.\n"
+        f'Reply with ONLY compact JSON: {{"decision":"HOLD"|"SELL","why":"<=10 words"}}.')
+    body = {"model": CLAUDE_MODEL, "max_tokens": 120,
+            "messages": [{"role": "user", "content": prompt}]}
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages",
+        data=json.dumps(body).encode(),
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        r = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+        txt = r["content"][0]["text"]
+        d = json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
+        return d.get("decision", "HOLD").upper(), (d.get("why", "") or "")[:120]
+    except Exception as e:
+        return None, str(e)[:80]
+
+
+def claude_decide():
+    """Model C: for moved Model-C positions, let Claude decide HOLD/SELL. Bounded by
+    MAX_CLAUDE_CALLS_PER_RUN + a 6h re-check throttle. Logs every decision + the why."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        print("claude_decide: no ANTHROPIC_API_KEY, skipping"); return
+    c = db()
+    now = time.time()
+    calls = sold = held = closed = 0
+    rows = c.execute("SELECT id,shares,stake,entry,title,outcome,copied_ts,last_check,mark_price,wallet "
+                     "FROM copies WHERE model='cdecide' AND status='open' AND mark_price IS NOT NULL "
+                     "ORDER BY id DESC LIMIT 500").fetchall()
+    for cid_id, shares, stake, entry, title, outcome, copied_ts, last_check, cur, wallet in rows:
+        if calls >= MAX_CLAUDE_CALLS_PER_RUN:
+            break
+        try:
+            age_h = (now - datetime.fromisoformat(copied_ts).timestamp()) / 3600
+        except Exception:
+            age_h = 0
+        gain = (cur - entry) / entry if entry else 0
+        if age_h >= CDECIDE_MAX_HOLD_HOURS:    # backstop force-close
+            c.execute("UPDATE copies SET status='c_closed',pnl=?,resolved_ts=?,last_reason=? WHERE id=?",
+                      (shares * cur - stake, now_iso(), "auto: 72h cap", cid_id))
+            c.execute("INSERT INTO decisions(ts,copy_id,wallet,title,entry,current,gain,decision,why) "
+                      "VALUES(?,?,?,?,?,?,?,?,?)",
+                      (now_iso(), cid_id, wallet, title, entry, cur, round(gain, 3), "SELL", "auto: 72h cap"))
+            closed += 1
+            c.commit(); continue
+        moved = gain >= 0.05 or gain <= -0.10
+        recently = False
+        if last_check:
+            try:
+                recently = (now - datetime.fromisoformat(last_check).timestamp()) < CLAUDE_RECHECK_HOURS * 3600
+            except Exception:
+                recently = False
+        if not moved or recently:
+            continue
+        decision, why = _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet)
+        calls += 1
+        if decision is None:
+            continue
+        c.execute("INSERT INTO decisions(ts,copy_id,wallet,title,entry,current,gain,decision,why) "
+                  "VALUES(?,?,?,?,?,?,?,?,?)",
+                  (now_iso(), cid_id, wallet, title, entry, cur, round(gain, 3), decision, why))
+        c.execute("UPDATE copies SET last_check=?,last_reason=? WHERE id=?", (now_iso(), why, cid_id))
+        if decision == "SELL":
+            c.execute("UPDATE copies SET status='c_sold',pnl=?,resolved_ts=? WHERE id=?",
+                      (shares * cur - stake, now_iso(), cid_id)); sold += 1
+        else:
+            held += 1
+        c.commit()
+    print(f"claude_decide: {calls} calls -> {sold} sold, {held} held, {closed} auto-closed")
+
+
+def export():
+    """Write docs/model_c.json for the live dashboard (Model C only)."""
+    c = db()
+    pos = c.execute("SELECT wallet,title,outcome,entry,mark_price,stake,pnl,status,last_reason,copied_ts "
+                    "FROM copies WHERE model='cdecide' ORDER BY id DESC").fetchall()
+    positions = []
+    for w, t, o, e, mk, stake, pnl, st, why, cts in pos:
+        gain = ((mk - e) / e * 100) if (mk and e) else 0
+        positions.append(dict(wallet=w, title=(t or "")[:80], outcome=o, entry=e, current=mk,
+                              gain=round(gain, 1), status=st, pnl=round(pnl, 2) if pnl is not None else None,
+                              why=why, opened=cts))
+    decs = c.execute("SELECT ts,wallet,title,entry,current,gain,decision,why FROM decisions "
+                     "ORDER BY id DESC LIMIT 200").fetchall()
+    decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], entry=d[3], current=d[4],
+                      gain=round((d[5] or 0) * 100, 1), decision=d[6], why=d[7]) for d in decs]
+    closed = [p for p in positions if p["status"] in ("c_sold", "c_closed", "won", "lost")]
+    wins = [p for p in closed if (p["pnl"] or 0) > 0]
+    kpi = dict(open=sum(1 for p in positions if p["status"] == "open"), closed=len(closed),
+               wins=len(wins), win_rate=round(len(wins) / len(closed) * 100, 1) if closed else 0,
+               realized=round(sum(p["pnl"] or 0 for p in closed), 2), decisions=len(decisions),
+               sold=sum(1 for p in positions if p["status"] == "c_sold"))
+    os.makedirs("docs", exist_ok=True)
+    json.dump(dict(updated=now_iso(), kpi=kpi, positions=positions[:300], decisions=decisions),
+              open("docs/model_c.json", "w"))
+    print("export: wrote docs/model_c.json ->", kpi)
+
+
+CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed")
 
 
 def _model_block(label, rows, note):
@@ -259,10 +378,13 @@ def report():
         print("  no copies yet — run tick.\n"); return
     hold = [(r[1], r[2], r[3]) for r in rows if r[0] == "hold"]
     exit_ = [(r[1], r[2], r[3]) for r in rows if r[0] == "exit"]
+    cdec = [(r[1], r[2], r[3]) for r in rows if r[0] == "cdecide"]
     _model_block("MODEL A: copy & HOLD to resolution", hold, "(slow — markets resolve weeks out)")
     print()
     _model_block("MODEL B: copy & SELL at +%d%% / %dh cap" % (TAKE_PROFIT * 100, MAX_HOLD_HOURS),
                  exit_, "(fast — closes in 1-3 days)")
+    print()
+    _model_block("MODEL C: Claude decides HOLD/SELL", cdec, "(AI exits — see dashboard for whys)")
     # detection lag
     lags = []
     for ct, tt in c.execute("SELECT copied_ts, their_ts FROM copies WHERE their_ts IS NOT NULL"):
@@ -278,4 +400,5 @@ def report():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
-    {"tick": tick, "resolve": resolve, "report": report}.get(cmd, report)()
+    {"tick": tick, "resolve": resolve, "report": report,
+     "claude_decide": claude_decide, "export": export}.get(cmd, report)()

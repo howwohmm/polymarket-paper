@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>model c — claude copytrader</title>
+<link rel="preconnect" href="https://api.fontshare.com">
+<link href="https://api.fontshare.com/v2/css?f[]=manrope@300,400,500&display=swap" rel="stylesheet">
+<style>
+  :root{ --bg:#262626; --panel:#2e2e2e; --line:#3a3a3a; --txt:#e8e8e8; --dim:#9a9a9a;
+         --green:#7fcf9f; --red:#e08f8f; --hold:#8fb8e0; }
+  *{ box-sizing:border-box; margin:0; padding:0 }
+  body{ background:var(--bg); color:var(--txt); font-family:'Manrope',system-ui,sans-serif;
+        font-weight:300; line-height:1.5; padding:32px 20px 80px; max-width:1100px; margin:0 auto;
+        -webkit-font-smoothing:antialiased }
+  h1{ font-weight:300; font-size:22px; letter-spacing:.3px }
+  .sub{ color:var(--dim); font-size:13px; margin-top:4px }
+  .row{ display:flex; flex-wrap:wrap; gap:12px; margin:28px 0 }
+  .kpi{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px 18px;
+        flex:1; min-width:120px }
+  .kpi .v{ font-size:26px; font-weight:400 } .kpi .l{ color:var(--dim); font-size:12px; margin-top:2px }
+  .sec{ font-size:13px; color:var(--dim); text-transform:lowercase; letter-spacing:.5px;
+        margin:34px 0 12px; border-bottom:1px solid var(--line); padding-bottom:8px }
+  .feed{ display:flex; flex-direction:column; gap:8px }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:13px 15px }
+  .card .top{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start }
+  .mkt{ font-size:14px; font-weight:400; flex:1 } .when{ color:var(--dim); font-size:11px; white-space:nowrap }
+  .why{ color:var(--dim); font-size:13px; margin-top:6px; font-style:italic }
+  .meta{ font-size:12px; color:var(--dim); margin-top:5px }
+  .badge{ font-size:11px; padding:2px 9px; border-radius:20px; font-weight:500 }
+  .SELL{ background:rgba(224,143,143,.15); color:var(--red) }
+  .HOLD{ background:rgba(143,184,224,.15); color:var(--hold) }
+  .pos{ color:var(--green) } .neg{ color:var(--red) }
+  table{ width:100%; border-collapse:collapse; font-size:13px }
+  th{ text-align:left; color:var(--dim); font-weight:400; font-size:11px; padding:8px 10px; border-bottom:1px solid var(--line) }
+  td{ padding:9px 10px; border-bottom:1px solid var(--line) }
+  tr:last-child td{ border-bottom:none }
+  .tag{ color:var(--dim); font-size:11px }
+  .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--green); margin-right:7px;
+        animation:p 2s infinite } @keyframes p{ 50%{ opacity:.3 } }
+</style>
+</head>
+<body>
+  <h1><span class="dot"></span>model c — claude copytrader</h1>
+  <div class="sub" id="sub">loading…</div>
+
+  <div class="row" id="kpis"></div>
+
+  <div class="sec">claude's decisions — every move &amp; why</div>
+  <div class="feed" id="feed"></div>
+
+  <div class="sec">open positions claude is holding</div>
+  <div id="postable"></div>
+
+<script>
+const J = n => (n==null?'—':(n>=0?'+':'')+'$'+Math.abs(n).toFixed(2));
+const ago = ts => { const s=(Date.now()-new Date(ts).getTime())/1000;
+  if(s<90)return Math.round(s)+'s ago'; if(s<5400)return Math.round(s/60)+'m ago';
+  if(s<129600)return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago'; };
+const gainClass = g => g>=0?'pos':'neg';
+
+async function load(){
+  let d; try{ d = await (await fetch('./model_c.json?'+Date.now())).json(); }
+  catch(e){ document.getElementById('sub').textContent='no data yet — bot is warming up'; return; }
+  const k=d.kpi;
+  document.getElementById('sub').textContent =
+    `updated ${ago(d.updated)} · auto-refreshes every 60s · $10 paper per copy · model c only`;
+  document.getElementById('kpis').innerHTML = [
+    ['open positions', k.open],
+    ['closed', k.closed],
+    ['win rate', (k.win_rate??0)+'%'],
+    ['realized p&l', J(k.realized)],
+    ['claude decisions', k.decisions],
+    ['sold by claude', k.sold],
+  ].map(([l,v])=>`<div class="kpi"><div class="v ${typeof v==='string'&&v[0]==='+'?'pos':typeof v==='string'&&v[0]==='-'?'neg':''}">${v}</div><div class="l">${l}</div></div>`).join('');
+
+  document.getElementById('feed').innerHTML = (d.decisions||[]).map(x=>`
+    <div class="card"><div class="top">
+      <div class="mkt">${x.title} <span class="tag">· ${x.outcome||''}</span></div>
+      <span class="when">${ago(x.ts)}</span></div>
+      <div class="meta">${x.wallet} · ${x.entry?.toFixed(2)} → ${x.current?.toFixed(2)}
+        <span class="${gainClass(x.gain)}">(${x.gain>=0?'+':''}${x.gain}%)</span>
+        <span class="badge ${x.decision}">${x.decision}</span></div>
+      <div class="why">“${x.why||''}”</div></div>`).join('') || '<div class="card">no decisions yet — claude acts once positions move ±5–10%</div>';
+
+  const open=(d.positions||[]).filter(p=>p.status==='open').slice(0,80);
+  document.getElementById('postable').innerHTML = `<table>
+    <tr><th>trader</th><th>market</th><th>entry→now</th><th>gain</th><th>claude's last note</th></tr>
+    ${open.map(p=>`<tr><td>${p.wallet}</td><td>${p.title}</td>
+      <td>${p.entry?.toFixed(2)} → ${p.current?p.current.toFixed(2):'—'}</td>
+      <td class="${gainClass(p.gain)}">${p.gain>=0?'+':''}${p.gain}%</td>
+      <td class="tag">${p.why||'—'}</td></tr>`).join('')}
+  </table>`;
+}
+load(); setInterval(load, 60000);
+</script>
+</body>
+</html>
