@@ -24,31 +24,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: tick every 3 min for ~45 min, then resolve + Claude decisions + export
+      - name: tick + flush dashboard every ~9 min (resolve + claude + export + commit)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          for i in $(seq 1 16); do
-            echo "--- tick $i/16 ($(date -u +%T)) ---"
-            python3 copybot.py tick || true
-            [ "$i" -lt 16 ] && sleep 180
-          done
-          timeout 360 python3 copybot.py resolve || true
-          timeout 300 python3 copybot.py claude_decide || true
-          python3 copybot.py export || true
-          python3 copybot.py report || true
-      - name: persist
-        run: |
           git config user.name "copybot"
           git config user.email "bot@users.noreply.github.com"
-          git add copybot.db docs/data.json
-          if git diff --staged --quiet; then
-            echo "no change"
-          else
-            git commit -m "copybot tick $(date -u +%FT%TZ)"
-            # resilient push: rebase + retry so one flaky push doesn't lose the hour
-            for attempt in 1 2 3; do
-              git pull --rebase --autostash origin main || true
-              git push && break || { echo "push attempt $attempt failed, retrying"; sleep 5; }
-            done
-          fi
+          flush(){
+            timeout 200 python3 copybot.py resolve || true
+            timeout 200 python3 copybot.py claude_decide || true
+            python3 copybot.py export || true
+            git add copybot.db docs/data.json
+            git diff --staged --quiet || { git commit -m "copybot $(date -u +%FT%TZ)"; \
+              for a in 1 2 3; do git pull --rebase --autostash origin main || true; git push && break || sleep 5; done; }
+          }
+          for i in $(seq 1 12); do
+            echo "--- tick $i/12 ($(date -u +%T)) ---"
+            python3 copybot.py tick || true
+            [ $((i % 3)) -eq 0 ] && flush      # flush dashboard every 3 ticks (~9 min)
+            [ "$i" -lt 12 ] && sleep 180
+          done
+          flush
+          python3 copybot.py report || true
