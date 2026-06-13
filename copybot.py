@@ -67,6 +67,30 @@ CHART_TRAIL_ACTIVATE = 0.25 # arm trailing at +25%
 CHART_TRAIL_DROP = 0.20     # lock win if drops 20% from peak
 CHART_MAX_HOLD_HOURS = 120  # 5-day max hold (same as D)
 
+# === Category + Quality Scoring (SDD v2 highest-leverage upgrade) ===
+# Auto-tag markets so we stop blindly copying specialists outside their lane.
+# Track per-trader per-category stats from *our own paper resolves*.
+# Only copy a trader in a category if they have proven edge here (min samples + WR/ROI).
+MIN_CAT_TRADES = 6
+MIN_CAT_WR = 0.53
+MIN_CAT_ROI = 0.06
+
+def categorize_market(title: str, slug: str = "", question: str = "") -> str:
+    t = (title or "").lower() + " " + (slug or "").lower() + " " + (question or "").lower()
+    if any(x in t for x in ["5m", "5 min", "five min", "up or down", "updown"]):
+        if any(x in t for x in ["btc", "bitcoin", "eth", "ethereum", "sol", "crypto"]):
+            return "crypto_5m"
+    if any(x in t for x in ["hour", "up or down", "crypto"]) and "5m" not in t:
+        if any(x in t for x in ["btc", "eth", "sol"]):
+            return "crypto_h"
+    if any(x in t for x in ["nba", "nfl", "mlb", "nhl", "tennis", "soccer", "world cup", "sports", "goal", "points"]):
+        return "sports"
+    if any(x in t for x in ["election", "president", "senate", "trump", "harris", "politics", "vote"]):
+        return "politics"
+    if "esports" in t or "league" in t:
+        return "esports"
+    return "other"
+
 # vetted copyable traders (small clip, taker, diversified, slow markets)
 WALLETS = {
     "GoalLineGhost": "0x0346afae2603313d2bbee96b628536c8cbe352a5",
@@ -260,6 +284,10 @@ def db():
         title TEXT, entry REAL, current REAL, gain REAL, decision TEXT, why TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS bankroll(
         model TEXT, trader TEXT, cash REAL, PRIMARY KEY(model,trader))""")
+    # Category + Quality Scoring tables (SDD v2)
+    c.execute("""CREATE TABLE IF NOT EXISTS trader_cat_stats(
+        trader TEXT, category TEXT, trades INTEGER, wins INTEGER, realized REAL,
+        last_ts TEXT, PRIMARY KEY(trader, category))""")
     return c
 
 
@@ -322,6 +350,30 @@ def _is_fast_market(title):
     t = (title or "").lower()
     return any(p in t for p in FAST_MARKET_PATTERNS)
 
+# === SDD v2 Category + Quality helpers ===
+def _get_trader_cat_quality(c, trader, category):
+    row = c.execute("SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
+                    (trader, category)).fetchone()
+    if not row or row[0] < MIN_CAT_TRADES:
+        return {"trades": row[0] if row else 0, "wr": 0.0, "roi": 0.0, "trusted": False}
+    trades, wins, realized = row
+    wr = wins / trades
+    roi = realized / max(1, trades * 2.0)  # proxy
+    trusted = (wr >= MIN_CAT_WR or roi >= MIN_CAT_ROI)
+    return {"trades": trades, "wr": round(wr, 3), "roi": round(roi, 3), "trusted": trusted}
+
+def _update_trader_cat_stat(c, trader, category, won: bool, pnl: float):
+    row = c.execute("SELECT trades, wins, realized FROM trader_cat_stats WHERE trader=? AND category=?",
+                    (trader, category)).fetchone()
+    if row:
+        trades, wins, realized = row
+        c.execute("""UPDATE trader_cat_stats SET trades=?, wins=?, realized=?, last_ts=?
+                     WHERE trader=? AND category=?""",
+                  (trades+1, wins + (1 if won else 0), realized + (pnl or 0), now_iso(), trader, category))
+    else:
+        c.execute("INSERT INTO trader_cat_stats VALUES (?,?,?,?,?,?)",
+                  (trader, category, 1, 1 if won else 0, pnl or 0, now_iso()))
+
 
 def tick():
     c = db()
@@ -378,6 +430,15 @@ def tick():
             if asset not in chart_cache:
                 chart_cache[asset] = chart_signal(asset)
             sig = chart_cache[asset]
+
+            # === SDD v2 Category + Quality gate (biggest lever) ===
+            # Only proceed with this trader in this category if they have proven edge in *our* paper history.
+            cat = categorize_market(a.get("title", ""), a.get("slug", ""), "")
+            q = _get_trader_cat_quality(c, name, cat)
+            if q["trades"] >= MIN_CAT_TRADES and not q["trusted"]:
+                # skip low-edge category for this specialist
+                continue
+
             for model in ("hold", "exit", "cdecide", "trail", "chart"):  # A B C D E
                 if model == "hold" and not hold_ok:
                     continue
@@ -419,13 +480,13 @@ def resolve():
     # newest-open prioritized for Model B (exit needs frequent price checks); bounded by
     # row count + wall-clock so a slow gamma API can't blow the job timeout.
     rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry,"
-                     "COALESCE(model,'hold'),copied_ts,wallet,peak,asset FROM copies "
+                     "COALESCE(model,'hold'),copied_ts,wallet,peak,asset,title FROM copies "
                      "WHERE status='open' ORDER BY id DESC LIMIT 150").fetchall()
     deadline = time.time() + 300
     now = time.time()
     settled = marked = exited = 0
     chart_cache = {}   # asset -> chart_signal, fetched lazily for Model E
-    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak, asset in rows:
+    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak, asset, title in rows:
         if time.time() > deadline:
             print("resolve: hit 5-min deadline, stopping early (rest next run)")
             break
@@ -445,6 +506,12 @@ def resolve():
             c.execute("UPDATE copies SET status=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
                       ("won" if won else "lost", 1.0 if won else 0.0, payout - stake, now_iso(), cid_id))
             _credit(c, model, wallet, payout)     # proceeds back to this trader's wallet
+            # SDD v2 quality stats update (per trader per category from our resolves)
+            try:
+                cat = categorize_market(title or "", "", "")
+                _update_trader_cat_stat(c, wallet, cat, won, payout - stake)
+            except Exception:
+                pass
             settled += 1
         elif model == "exit":                     # Model B: take-profit / timeout exit
             gain = (cur - entry) / entry if entry > 0 else 0
@@ -700,6 +767,18 @@ def export():
               open("docs/data.json", "w"))
     print("export: traders=%d, model totals:" % len(traders),
           {mn: models[mn]["value"] for _, mn in MODELS})
+
+    # SDD v2: dump quality matrix (category specialization scores) for dashboard intelligence
+    quality = []
+    for trader in list(WALLETS.keys()):
+        row = {"name": trader}
+        for cat in ["sports", "crypto_5m", "politics", "crypto_h", "other"]:
+            q = _get_trader_cat_quality(c, trader, cat)
+            row[cat] = q
+        quality.append(row)
+    with open("docs/quality.json", "w") as f:
+        json.dump({"updated": now_iso(), "quality": quality}, f)
+    print("export: also wrote docs/quality.json (trader x category edge matrix)")
 
 
 def _model_block(label, rows, note):

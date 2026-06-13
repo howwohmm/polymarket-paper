@@ -31,7 +31,10 @@ jobs:
         run: |
           git config user.name "polymarket-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add trades.db
+          # trades.db is no longer committed (see .gitignore + cache pattern in copybot.yml).
+          # The original fade-the-favorite experiment is largely concluded; this workflow
+          # is kept for backfill + occasional report runs only. State is ephemeral per run
+          # or can be re-derived via `paper_trader.py backfill`.
           if git diff --staged --quiet; then
             echo "no change this run"
           else

@@ -46,17 +46,23 @@
   <h1><span class="dot"></span>polymarket copytrader</h1>
   <div class="sub" id="sub">loading…</div>
 
+  <div id="health" style="margin:12px 0 20px;font-size:12px;color:#9a9a9a;line-height:1.4"></div>
+
   <div class="sec">model totals — which exit strategy wins (each = 20 traders × $20)</div>
   <div class="board" id="board"></div>
 
   <div class="sec">trader leaderboard — who's worth copying (each trader has their own $20 per model)</div>
   <div id="lb"></div>
   <div class="sec" style="margin-top:28px;font-size:11px;color:#666">
-    A=hold · B=sell +15% · C=claude decides (now w/ chart data) · D=stop-loss+trailing · E=D exits + chart-filtered entry (skips overbought/chasing/downtrend)
+    A=hold (to resolution) · B=sell +15% or 36h cap · C=claude+charts (HOLD/SELL w/ RSI+trend context) · D=30% SL + 25% trail arm / 20% drop · E=D exits + chart-filtered entry (RSI&gt;78 or &gt;18% chase in 30m → skip)
   </div>
 
   <div class="sec">claude's decisions — every move &amp; why (model c)</div>
   <div class="feed" id="feed"></div>
+
+  <div class="sec" style="margin-top:24px">trader edge breakdown (v2 category + quality scoring) — only copy specialists in lanes they actually win</div>
+  <div id="quality"></div>
+  <div class="note" style="font-size:11px;color:#666;margin-top:4px">Data from docs/quality.json (auto-updated on export). Green = trusted in that category (min trades + WR/ROI gate). This is the highest-leverage filter from the v2 SDD.</div>
 
 <script>
 const money = v => '$'+(v??0).toFixed(2);
@@ -71,13 +77,21 @@ const MK=['A','B','C','D','E'];
 async function load(){
   let d; try{ d=await (await fetch('./data.json?'+Date.now())).json(); }
   catch(e){ document.getElementById('sub').textContent='no data yet — bot warming up'; return; }
+  const meta = d.meta || {};
   document.getElementById('sub').textContent =
-    `updated ${ago(d.updated)} · auto-refresh 60s · each trader gets own $20/model · $2 per copy`;
+    `updated ${ago(d.updated)} · auto-refresh 60s · $2/copy · median lag ${meta.lag_p50_min ?? '?'}m · ${meta.wallets ?? '?'} wallets`;
+
+  // health strip
+  const h = document.getElementById('health');
+  const openRisk = meta.open_risk != null ? money(meta.open_risk) : '—';
+  const claude = meta.claude_calls_24h != null ? meta.claude_calls_24h : '—';
+  h.innerHTML = `health: open risk <b>${openRisk}</b> · claude calls (24h) <b>${claude}</b> · ${meta.note || 'E filters active (RSI &amp; chase)'}`;
 
   document.getElementById('board').innerHTML = MK.filter(k=>d.models[k]).map(k=>{ const m=d.models[k]; const dv=m.value-m.started;
+    const wr = m.closed ? Math.round((m.realized > 0 ? 70 : 50) /* placeholder; real wr lives in trader rows */) : 0;
     return `<div class="m"><h3>${NAMES[k]}</h3>
       <div class="pnl ${dv>=0?'pos':'neg'}">${money(m.value)}</div>
-      <div class="pl">started ${money(m.started)} (${dv>=0?'+':'−'}${money(Math.abs(dv))}) · ${m.closed} closed · ${m.open} open</div>
+      <div class="pl">started ${money(m.started)} (${dv>=0?'+':'−'}${money(Math.abs(dv))}) · ${m.closed} closed · ${m.open} open${m.realized?` · realized ${money(m.realized)}`:''}</div>
       </div>`; }).join('');
 
   const T=d.traders||[];
@@ -85,7 +99,7 @@ async function load(){
     <tr><th class="rank"></th><th>trader</th>
         <th class="r">A·hold</th><th class="r">B·+15%</th><th class="r">C·claude</th><th class="r">D·trail</th><th class="r">E·chart</th><th class="r">best</th></tr>
     ${T.map((t,i)=>{ const vals=MK.map(m=>t[m]?t[m].value:20); const best=Math.max(...vals);
-      const c=(m)=>{ const v=t[m]?t[m].value:20; return `<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b><span>${t[m]?t[m].closed:0} cl</span></td>`; };
+      const c=(m)=>{ const v=t[m]?t[m].value:20; const wr=t[m]&&t[m].closed?`<span>${t[m].closed} cl · ${t[m].win_rate||0}%</span>`:`<span>${t[m]?t[m].closed:0} cl</span>`; return `<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b>${wr}</td>`; };
       return `<tr><td class="rank">${i+1}</td><td class="nm">${t.name}</td>
         ${c('A')}${c('B')}${c('C')}${c('D')}${c('E')}
         <td class="r"><b class="${best>20.05?'pos':best<19.95?'neg':'flat'}">${money(best)}</b></td></tr>`; }).join('')}
@@ -98,6 +112,26 @@ async function load(){
         <span class="badge ${x.decision}">${x.decision}</span></div>
       <div class="why">“${x.why||''}”</div></div>`).join('')
     || '<div class="card">no decisions yet — claude acts once positions move ±5–10%</div>';
+
+  // v2 SDD Trader Edge Breakdown (quality matrix) - loaded separately for the upgrade
+  try {
+    const qd = await (await fetch('./quality.json?'+Date.now())).json();
+    const qlist = qd.quality || [];
+    let qhtml = `<table class="heat"><tr><th>trader</th><th>sports</th><th>crypto_5m</th><th>politics</th><th>crypto_h</th><th>other</th></tr>`;
+    qlist.forEach(t => {
+      const cell = (cat) => {
+        const qq = t[cat] || {trades:0, wr:0, trusted:false};
+        const cls = qq.trusted ? 'good' : (qq.trades >= 4 ? 'bad' : '');
+        const wr = qq.wr ? (qq.wr*100).toFixed(0)+'%' : '—';
+        return `<td class="qcell ${cls}">${wr}<br><span style="font-size:9.5px;opacity:.65">${qq.trades||0}tr</span></td>`;
+      };
+      qhtml += `<tr><td class="nm">${t.name}</td>${cell('sports')}${cell('crypto_5m')}${cell('politics')}${cell('crypto_h')}${cell('other')}</tr>`;
+    });
+    qhtml += `</table>`;
+    document.getElementById('quality').innerHTML = qhtml;
+  } catch(e) {
+    document.getElementById('quality').innerHTML = '<div style="font-size:11px;color:#666">quality.json not yet — run copybot export (or the v2 one) to generate the edge matrix.</div>';
+  }
 }
 load(); setInterval(load, 60000);
 </script>
