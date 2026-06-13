@@ -61,7 +61,7 @@ TRAIL_MAX_HOLD_HOURS = 120  # otherwise hold up to 5 days
 # Goal: copy the same traders but only when the chart agrees → fewer losers at same upside.
 CHART_LOOKBACK_MINS = 60    # 1h of 1-min CLOB candles for indicators
 CHART_RSI_OVERBOUGHT = 78   # skip entry if RSI > 78 (price already spiked, likely to retrace)
-CHART_CHASE_LIMIT = 0.18    # skip if price ran >18% in last 30 min (we'd be chasing)
+CHART_CHASE_LIMIT = 0.10    # skip if price ran >10 cents absolute in last 30 min (was % of entry — broke on low-prob underdogs)
 CHART_STOP_LOSS = 0.30      # same stop as D (30% loss → cut)
 CHART_TRAIL_ACTIVATE = 0.25 # arm trailing at +25%
 CHART_TRAIL_DROP = 0.20     # lock win if drops 20% from peak
@@ -220,9 +220,9 @@ def _chart_entry_ok(sig, entry):
     trend  = sig["trend_ph"]
     if rsi > CHART_RSI_OVERBOUGHT:
         return False, f"overbought_rsi({rsi:.0f})"
-    if entry > 0 and mom_30 / entry > CHART_CHASE_LIMIT:
-        return False, f"chasing_30m(+{mom_30/entry*100:.0f}%)"
-    if trend < -0.05 and mom_30 < -0.08:
+    if mom_30 > CHART_CHASE_LIMIT:
+        return False, f"chasing_30m(+{mom_30:.3f} abs)"
+    if trend < -0.05 and mom_30 < -0.05:
         return False, f"downtrend({trend:+.3f}/hr)"
     # Volume: if we have data and volume is drying up fast with sell pressure, skip
     vol_ratio    = sig.get("vol_ratio")
