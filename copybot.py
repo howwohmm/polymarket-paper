@@ -29,6 +29,7 @@ from pathlib import Path
 
 DATA = "https://data-api.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
+CLOB = "https://clob.polymarket.com"
 DB = Path(__file__).parent / "copybot.db"
 # REAL $20 wallet per model: each model starts with $20, bets $2/trade (so up to ~10
 # positions at once), and can only open a copy if it has free cash. When a position
@@ -54,6 +55,17 @@ STOP_LOSS = 0.30            # sell if down 30% from entry (cut the trader's wron
 TRAIL_ACTIVATE = 0.25       # once up 25%, arm the trailing stop
 TRAIL_DROP = 0.20           # then sell if it falls 20% from its peak (lock the win, let it run)
 TRAIL_MAX_HOLD_HOURS = 120  # otherwise hold up to 5 days
+
+# Model E: "chart-aware" — same D exit rules, but ENTRY filtered by chart signals.
+# Skip trades where the price chart says: overbought (RSI), chasing a spike, or downtrend.
+# Goal: copy the same traders but only when the chart agrees → fewer losers at same upside.
+CHART_LOOKBACK_MINS = 60    # 1h of 1-min CLOB candles for indicators
+CHART_RSI_OVERBOUGHT = 78   # skip entry if RSI > 78 (price already spiked, likely to retrace)
+CHART_CHASE_LIMIT = 0.18    # skip if price ran >18% in last 30 min (we'd be chasing)
+CHART_STOP_LOSS = 0.30      # same stop as D (30% loss → cut)
+CHART_TRAIL_ACTIVATE = 0.25 # arm trailing at +25%
+CHART_TRAIL_DROP = 0.20     # lock win if drops 20% from peak
+CHART_MAX_HOLD_HOURS = 120  # 5-day max hold (same as D)
 
 # vetted copyable traders (small clip, taker, diversified, slow markets)
 WALLETS = {
@@ -85,6 +97,96 @@ def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=25) as r:
         return json.loads(r.read().decode())
+
+
+def chart_signal(token_id):
+    """Fetch last 1h of 1-min price data for a Polymarket token and return chart indicators.
+
+    Uses Polymarket CLOB prices-history endpoint (free, no key).
+    Returns dict with: current, trend_ph (trend per hour), rsi, mom_5m, mom_30m,
+    vol (volatility), support, resistance, bars (number of data points).
+    Returns None if API fails or insufficient data (<20 bars).
+    """
+    end_ts = int(time.time())
+    start_ts = end_ts - CHART_LOOKBACK_MINS * 60
+    try:
+        data = get(f"{CLOB}/prices-history?market={token_id}&startTs={start_ts}&endTs={end_ts}&fidelity=1")
+        hist = data.get("history", [])
+    except Exception:
+        return None
+    if len(hist) < 20:
+        return None
+    prices = [float(h["p"]) for h in hist]
+    n = len(prices)
+
+    # Linear regression slope (per minute → converted to per hour = trend_ph)
+    x_mean = (n - 1) / 2
+    y_mean = sum(prices) / n
+    denom = sum((i - x_mean) ** 2 for i in range(n))
+    slope = sum((i - x_mean) * (prices[i] - y_mean) for i in range(n)) / denom if denom else 0
+    trend_ph = slope * 60
+
+    # RSI(14) on 1-min changes (probability version: same math, range 0–1 prices)
+    changes = [prices[i] - prices[i - 1] for i in range(1, n)]
+    period = min(14, len(changes))
+    gains = [max(c, 0) for c in changes[-period:]]
+    losses = [abs(min(c, 0)) for c in changes[-period:]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0 and avg_gain == 0:
+        rsi = 50.0
+    elif avg_loss == 0:
+        rsi = 100.0
+    else:
+        rsi = round(100 - 100 / (1 + avg_gain / avg_loss), 1)
+
+    # Momentum: price change over last 5 and 30 minutes
+    mom_5 = round(prices[-1] - prices[max(0, n - 6)], 4)
+    mom_30 = round(prices[-1] - prices[max(0, n - 31)], 4)
+
+    # Volatility: rolling std of last 30 bars
+    window = prices[max(0, n - 30):]
+    mean_w = sum(window) / len(window)
+    vol = round((sum((p - mean_w) ** 2 for p in window) / len(window)) ** 0.5, 4)
+
+    # Support / resistance from last 60 bars (20th / 80th percentile)
+    hist60 = sorted(prices[max(0, n - 60):])
+    support = round(hist60[len(hist60) // 5], 4)
+    resistance = round(hist60[4 * len(hist60) // 5], 4)
+
+    return {
+        "current": round(prices[-1], 4),
+        "trend_ph": round(trend_ph, 4),
+        "rsi": rsi,
+        "mom_5m": mom_5,
+        "mom_30m": mom_30,
+        "vol": vol,
+        "support": support,
+        "resistance": resistance,
+        "bars": n,
+    }
+
+
+def _chart_entry_ok(sig, entry):
+    """Return (ok: bool, reason: str). False = skip this Model E entry.
+
+    Filters:
+    - RSI > CHART_RSI_OVERBOUGHT: price already spiked, likely to retrace
+    - 30m momentum / entry > CHART_CHASE_LIMIT: we'd be chasing a spike
+    - Strong downtrend (trend_ph < -0.05) + negative 30m momentum: market disagrees
+    """
+    if not sig:
+        return True, ""
+    rsi = sig["rsi"]
+    mom_30 = sig["mom_30m"]
+    trend = sig["trend_ph"]
+    if rsi > CHART_RSI_OVERBOUGHT:
+        return False, f"overbought_rsi({rsi:.0f})"
+    if entry > 0 and mom_30 / entry > CHART_CHASE_LIMIT:
+        return False, f"chasing_30m(+{mom_30/entry*100:.0f}%)"
+    if trend < -0.05 and mom_30 < -0.08:
+        return False, f"downtrend({trend:+.3f}/hr)"
+    return True, ""
 
 
 def now_iso():
@@ -181,7 +283,9 @@ def tick():
     c = db()
     now = int(time.time())
     added = 0
-    mkt_cache = {}   # per-tick cache of gamma markets -> current price + endDate
+    skipped_chart = 0
+    mkt_cache = {}    # condition_id -> gamma market data
+    chart_cache = {}  # asset (token_id) -> chart_signal result
     for name, addr in WALLETS.items():
         try:
             act = get(f"{DATA}/activity?user={addr}&limit=100")
@@ -226,9 +330,18 @@ def tick():
                 hold_ok = hnow < end <= hnow + timedelta(days=MAX_HOLD_RESOLVE_DAYS)
             except Exception:
                 hold_ok = False
-            for model in ("hold", "exit", "cdecide", "trail"):  # A=hold B=+15% C=Claude D=trail
+            # Chart signal (fetched once per asset, cached across this tick run)
+            if asset not in chart_cache:
+                chart_cache[asset] = chart_signal(asset)
+            sig = chart_cache[asset]
+            for model in ("hold", "exit", "cdecide", "trail", "chart"):  # A B C D E
                 if model == "hold" and not hold_ok:
                     continue
+                if model == "chart":
+                    ok, reason = _chart_entry_ok(sig, entry)
+                    if not ok:
+                        skipped_chart += 1
+                        continue  # chart says skip this entry
                 key = f"{base}:{model}"
                 if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
                     continue
@@ -243,7 +356,8 @@ def tick():
                 _credit(c, model, name, -STAKE)     # lock stake out of THIS trader's wallet
                 added += 1
         c.commit()
-    print(f"tick: recorded {added} new paper copies (x2 models) across {len(WALLETS)} wallets")
+    print(f"tick: recorded {added} new paper copies across {len(WALLETS)} wallets "
+          f"(chart filtered {skipped_chart} entries)")
 
 
 def _market_by_condition(cid):
@@ -261,12 +375,13 @@ def resolve():
     # newest-open prioritized for Model B (exit needs frequent price checks); bounded by
     # row count + wall-clock so a slow gamma API can't blow the job timeout.
     rows = c.execute("SELECT id,condition_id,outcome_index,shares,stake,entry,"
-                     "COALESCE(model,'hold'),copied_ts,wallet,peak FROM copies "
+                     "COALESCE(model,'hold'),copied_ts,wallet,peak,asset FROM copies "
                      "WHERE status='open' ORDER BY id DESC LIMIT 150").fetchall()
     deadline = time.time() + 300
     now = time.time()
     settled = marked = exited = 0
-    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak in rows:
+    chart_cache = {}   # asset -> chart_signal, fetched lazily for Model E
+    for cid_id, cid, oidx, shares, stake, entry, model, copied_ts, wallet, peak, asset in rows:
         if time.time() > deadline:
             print("resolve: hit 5-min deadline, stopping early (rest next run)")
             break
@@ -279,7 +394,7 @@ def resolve():
             continue
         oidx = oidx if oidx is not None else 0
         cur = prices[oidx] if oidx < len(prices) else entry
-        if m.get("closed"):                       # market resolved -> settle either model
+        if m.get("closed"):                       # market resolved -> settle any model
             win_idx = max(range(len(prices)), key=lambda i: prices[i])
             won = (win_idx == oidx) and prices[win_idx] > 0.5
             payout = shares if won else 0.0
@@ -321,24 +436,59 @@ def resolve():
             else:                                 # still running -> update peak, let it ride
                 c.execute("UPDATE copies SET peak=?,mark_price=?,pnl=? WHERE id=?",
                           (pk, cur, shares * cur - stake, cid_id)); marked += 1
+        elif model == "chart":                    # Model E: chart-aware (filtered entry + same D exits)
+            pk = max(peak or entry, cur)
+            gain = (cur - entry) / entry if entry else 0
+            try:
+                age_h = (now - datetime.fromisoformat(copied_ts).timestamp()) / 3600
+            except Exception:
+                age_h = 0
+            # Fetch chart signal lazily (only for positions that have moved ≥5%)
+            sig = None
+            if abs(gain) >= 0.05 and asset:
+                if asset not in chart_cache:
+                    chart_cache[asset] = chart_signal(asset)
+                sig = chart_cache[asset]
+            if gain <= -CHART_STOP_LOSS:
+                c.execute("UPDATE copies SET status='e_stop',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "chart", wallet, shares * cur); exited += 1
+            elif pk >= entry * (1 + CHART_TRAIL_ACTIVATE) and cur <= pk * (1 - CHART_TRAIL_DROP):
+                c.execute("UPDATE copies SET status='e_trail',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "chart", wallet, shares * cur); exited += 1
+            elif age_h >= CHART_MAX_HOLD_HOURS:
+                c.execute("UPDATE copies SET status='e_closed',peak=?,mark_price=?,pnl=?,resolved_ts=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, now_iso(), cid_id)); _credit(c, "chart", wallet, shares * cur); exited += 1
+            else:
+                c.execute("UPDATE copies SET peak=?,mark_price=?,pnl=? WHERE id=?",
+                          (pk, cur, shares * cur - stake, cid_id)); marked += 1
         else:                                     # Model A: hold, just mark-to-market
             c.execute("UPDATE copies SET mark_price=?,pnl=? WHERE id=?",
                       (cur, shares * cur - stake, cid_id)); marked += 1
     c.commit()
-    print(f"resolve: settled {settled}, Model-B exits {exited}, marked {marked}")
+    print(f"resolve: settled {settled}, exits {exited}, marked {marked}")
 
 
-def _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet):
-    """Ask Claude HOLD or SELL for one copied position. Returns (decision, why) or (None, err)."""
+def _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet, sig=None):
+    """Ask Claude HOLD or SELL for one copied position. Returns (decision, why) or (None, err).
+    sig: optional chart_signal() dict — if provided, Claude gets RSI/trend/momentum context.
+    """
+    chart_ctx = ""
+    if sig:
+        trend_dir = "uptrend" if sig["trend_ph"] > 0.02 else ("downtrend" if sig["trend_ph"] < -0.02 else "flat")
+        chart_ctx = (
+            f"\nChart (last 1h): RSI {sig['rsi']:.0f} | trend {trend_dir} ({sig['trend_ph']:+.3f}/hr) | "
+            f"30m momentum {sig['mom_30m']:+.3f} | support {sig['support']:.3f} | resistance {sig['resistance']:.3f}."
+        )
     prompt = (
         f"You manage a Polymarket COPY position (mirroring trader {wallet}).\n"
         f'Market: "{title}"\n'
-        f"Bought outcome: {outcome} at {entry:.3f}, now {cur:.3f} ({gain*100:+.1f}%), held {age_h:.0f}h.\n"
+        f"Bought outcome: {outcome} at {entry:.3f}, now {cur:.3f} ({gain*100:+.1f}%), held {age_h:.0f}h."
+        f"{chart_ctx}\n"
         f"You're copying a SKILLED trader who bought this expecting it to win. Default to HOLD "
-        f"to capture the full move. SELL only if (a) it's clearly going wrong — down sharply with no "
-        f"path back, or (b) it spiked up and is now reversing (lock the gain). Do NOT bank small early "
-        f"gains — let winners run toward resolution.\n"
-        f'Reply with ONLY compact JSON: {{"decision":"HOLD"|"SELL","why":"<=10 words"}}.')
+        f"to capture the full move. SELL only if (a) clearly going wrong — down sharply with no path back, "
+        f"or (b) spiked up and now reversing (high RSI + falling from peak = lock the gain). "
+        f"Do NOT bank small early gains — let winners run toward resolution.\n"
+        f'Reply with ONLY compact JSON: {{"decision":"HOLD"|"SELL","why":"<=12 words"}}.')
     body = {"model": CLAUDE_MODEL, "max_tokens": 120,
             "messages": [{"role": "user", "content": prompt}]}
     req = urllib.request.Request("https://api.anthropic.com/v1/messages",
@@ -354,18 +504,21 @@ def _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet):
 
 
 def claude_decide():
-    """Model C: for moved Model-C positions, let Claude decide HOLD/SELL. Bounded by
-    MAX_CLAUDE_CALLS_PER_RUN + a 6h re-check throttle. Logs every decision + the why."""
+    """Model C: for moved Model-C positions, let Claude decide HOLD/SELL.
+    Claude now receives live chart data (RSI, trend, momentum) for each position,
+    enabling richer reasoning than price + age alone.
+    Bounded by MAX_CLAUDE_CALLS_PER_RUN + a 6h re-check throttle."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         print("claude_decide: no ANTHROPIC_API_KEY, skipping"); return
     c = db()
     now = time.time()
     calls = sold = held = closed = 0
-    rows = c.execute("SELECT id,shares,stake,entry,title,outcome,copied_ts,last_check,mark_price,wallet "
+    chart_cache = {}  # asset -> chart_signal, fetched once per unique token this run
+    rows = c.execute("SELECT id,shares,stake,entry,title,outcome,copied_ts,last_check,mark_price,wallet,asset "
                      "FROM copies WHERE model='cdecide' AND status='open' AND mark_price IS NOT NULL "
                      "ORDER BY id DESC LIMIT 500").fetchall()
-    for cid_id, shares, stake, entry, title, outcome, copied_ts, last_check, cur, wallet in rows:
+    for cid_id, shares, stake, entry, title, outcome, copied_ts, last_check, cur, wallet, asset in rows:
         if calls >= MAX_CLAUDE_CALLS_PER_RUN:
             break
         try:
@@ -391,7 +544,13 @@ def claude_decide():
                 recently = False
         if not moved or recently:
             continue
-        decision, why = _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet)
+        # Fetch chart signal for this position (cached per asset per run)
+        sig = None
+        if asset:
+            if asset not in chart_cache:
+                chart_cache[asset] = chart_signal(asset)
+            sig = chart_cache[asset]
+        decision, why = _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet, sig=sig)
         calls += 1
         if decision is None:
             continue
@@ -408,14 +567,15 @@ def claude_decide():
     print(f"claude_decide: {calls} calls -> {sold} sold, {held} held, {closed} auto-closed")
 
 
-CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed", "d_stop", "d_trail", "d_closed")
+CLOSED = ("won", "lost", "exit_won", "exit_closed", "c_sold", "c_closed",
+          "d_stop", "d_trail", "d_closed", "e_stop", "e_trail", "e_closed")
 
 
 def export():
     """Write docs/data.json: each trader's OWN $20 wallet under each model (A/B/C),
     a trader leaderboard (who's worth copying), model aggregates, and Claude's decisions."""
     c = db()
-    MODELS = [("hold", "A"), ("exit", "B"), ("cdecide", "C"), ("trail", "D")]
+    MODELS = [("hold", "A"), ("exit", "B"), ("cdecide", "C"), ("trail", "D"), ("chart", "E")]
     agg = {}   # (model, trader) -> stats
     for model, wallet, status, pnl, stake in c.execute(
             "SELECT model,wallet,status,COALESCE(pnl,0),stake FROM copies"):
@@ -438,7 +598,8 @@ def export():
             row[mn] = dict(value=round(ch + d["at_risk"] + d["unreal"], 2),
                            realized=round(d["realized"], 2), open=d["open"], closed=d["closed"],
                            win_rate=round(d["wins"] / d["closed"] * 100) if d["closed"] else 0)
-        row["best"] = round(max(row["A"]["value"], row["B"]["value"], row["C"]["value"], row["D"]["value"]), 2)
+        row["best"] = round(max(row["A"]["value"], row["B"]["value"], row["C"]["value"],
+                                row["D"]["value"], row["E"]["value"]), 2)
         traders.append(row)
     traders.sort(key=lambda r: -r["best"])
 

@@ -51,6 +51,9 @@
 
   <div class="sec">trader leaderboard — who's worth copying (each trader has their own $20 per model)</div>
   <div id="lb"></div>
+  <div class="sec" style="margin-top:28px;font-size:11px;color:#666">
+    A=hold · B=sell +15% · C=claude decides (now w/ chart data) · D=stop-loss+trailing · E=D exits + chart-filtered entry (skips overbought/chasing/downtrend)
+  </div>
 
   <div class="sec">claude's decisions — every move &amp; why (model c)</div>
   <div class="feed" id="feed"></div>
@@ -62,8 +65,8 @@ const cell = v => { const c = v>20.05?'pos':v<19.95?'neg':'flat';
 const ago = ts => { const s=(Date.now()-new Date(ts).getTime())/1000;
   if(s<90)return Math.round(s)+'s ago'; if(s<5400)return Math.round(s/60)+'m ago';
   if(s<129600)return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago'; };
-const NAMES={A:'A · hold',B:'B · sell +15%',C:'C · claude',D:'D · cut losers, ride winners'};
-const MK=['A','B','C','D'];
+const NAMES={A:'A · hold',B:'B · sell +15%',C:'C · claude+charts',D:'D · cut losers, ride winners',E:'E · chart-filtered entry'};
+const MK=['A','B','C','D','E'];
 
 async function load(){
   let d; try{ d=await (await fetch('./data.json?'+Date.now())).json(); }
@@ -80,11 +83,11 @@ async function load(){
   const T=d.traders||[];
   document.getElementById('lb').innerHTML = `<table>
     <tr><th class="rank"></th><th>trader</th>
-        <th class="r">A·hold</th><th class="r">B·+15%</th><th class="r">C·claude</th><th class="r">D·trail</th><th class="r">best</th></tr>
+        <th class="r">A·hold</th><th class="r">B·+15%</th><th class="r">C·claude</th><th class="r">D·trail</th><th class="r">E·chart</th><th class="r">best</th></tr>
     ${T.map((t,i)=>{ const vals=MK.map(m=>t[m]?t[m].value:20); const best=Math.max(...vals);
       const c=(m)=>{ const v=t[m]?t[m].value:20; return `<td class="r cell ${v===best&&v>20.05?'win':''}"><b class="${v>20.05?'pos':v<19.95?'neg':'flat'}">${money(v)}</b><span>${t[m]?t[m].closed:0} cl</span></td>`; };
       return `<tr><td class="rank">${i+1}</td><td class="nm">${t.name}</td>
-        ${c('A')}${c('B')}${c('C')}${c('D')}
+        ${c('A')}${c('B')}${c('C')}${c('D')}${c('E')}
         <td class="r"><b class="${best>20.05?'pos':best<19.95?'neg':'flat'}">${money(best)}</b></td></tr>`; }).join('')}
   </table>`;
 
