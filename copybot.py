@@ -100,12 +100,11 @@ def get(url):
 
 
 def chart_signal(token_id):
-    """Fetch last 1h of 1-min price data for a Polymarket token and return chart indicators.
+    """Fetch last 1h of price + volume data for a Polymarket token.
 
-    Uses Polymarket CLOB prices-history endpoint (free, no key).
-    Returns dict with: current, trend_ph (trend per hour), rsi, mom_5m, mom_30m,
-    vol (volatility), support, resistance, bars (number of data points).
-    Returns None if API fails or insufficient data (<20 bars).
+    Price (CLOB prices-history): RSI, trend, momentum, volatility, support/resistance.
+    Volume (data-api trades): $ volume, buy pressure, VWAP, vol_ratio.
+    Returns None if price fetch fails or <20 bars. Volume keys absent if trades fail.
     """
     end_ts = int(time.time())
     start_ts = end_ts - CHART_LOOKBACK_MINS * 60
@@ -119,14 +118,14 @@ def chart_signal(token_id):
     prices = [float(h["p"]) for h in hist]
     n = len(prices)
 
-    # Linear regression slope (per minute → converted to per hour = trend_ph)
+    # Linear regression slope (per minute → per hour)
     x_mean = (n - 1) / 2
     y_mean = sum(prices) / n
     denom = sum((i - x_mean) ** 2 for i in range(n))
     slope = sum((i - x_mean) * (prices[i] - y_mean) for i in range(n)) / denom if denom else 0
     trend_ph = slope * 60
 
-    # RSI(14) on 1-min changes (probability version: same math, range 0–1 prices)
+    # RSI(14) on 1-min changes
     changes = [prices[i] - prices[i - 1] for i in range(1, n)]
     period = min(14, len(changes))
     gains = [max(c, 0) for c in changes[-period:]]
@@ -140,52 +139,97 @@ def chart_signal(token_id):
     else:
         rsi = round(100 - 100 / (1 + avg_gain / avg_loss), 1)
 
-    # Momentum: price change over last 5 and 30 minutes
+    # Momentum
     mom_5 = round(prices[-1] - prices[max(0, n - 6)], 4)
     mom_30 = round(prices[-1] - prices[max(0, n - 31)], 4)
 
-    # Volatility: rolling std of last 30 bars
+    # Volatility (30-bar std)
     window = prices[max(0, n - 30):]
     mean_w = sum(window) / len(window)
-    vol = round((sum((p - mean_w) ** 2 for p in window) / len(window)) ** 0.5, 4)
+    price_vol = round((sum((p - mean_w) ** 2 for p in window) / len(window)) ** 0.5, 4)
 
-    # Support / resistance from last 60 bars (20th / 80th percentile)
+    # Support / resistance (20th / 80th pct of last 60 bars)
     hist60 = sorted(prices[max(0, n - 60):])
     support = round(hist60[len(hist60) // 5], 4)
     resistance = round(hist60[4 * len(hist60) // 5], 4)
 
-    return {
+    sig = {
         "current": round(prices[-1], 4),
         "trend_ph": round(trend_ph, 4),
         "rsi": rsi,
         "mom_5m": mom_5,
         "mom_30m": mom_30,
-        "vol": vol,
+        "price_vol": price_vol,
         "support": support,
         "resistance": resistance,
         "bars": n,
     }
 
+    # --- Volume (data-api trades) ---
+    # Each trade: size = shares, price = $/share → dollar_value = size * price
+    try:
+        now_ts = int(time.time())
+        cutoff_1h  = now_ts - 3600
+        cutoff_15m = now_ts - 900
+        trades = None
+        for url in [f"{DATA}/trades?market={token_id}&limit=500",
+                    f"{DATA}/trades?asset={token_id}&limit=500"]:
+            try:
+                result = get(url)
+                if result and isinstance(result, list) and len(result) > 0:
+                    trades = result
+                    break
+            except Exception:
+                continue
+        if trades:
+            def dv(t): return float(t.get("size") or 0) * float(t.get("price") or 0)
+            h1 = [t for t in trades if int(t.get("timestamp") or 0) >= cutoff_1h]
+            if h1:
+                vol_1h   = sum(dv(t) for t in h1)
+                vol_15m  = sum(dv(t) for t in h1 if int(t.get("timestamp") or 0) >= cutoff_15m)
+                avg_15m  = vol_1h / 4  # expected 15-min slice if uniform
+                vol_ratio = round(vol_15m / avg_15m, 2) if avg_15m > 0 else 1.0
+                buy_dv   = sum(dv(t) for t in h1 if (t.get("side") or "").upper() == "BUY")
+                buy_pressure = round(buy_dv / vol_1h, 2) if vol_1h > 0 else 0.5
+                sum_pv   = sum(float(t.get("price") or 0) * float(t.get("size") or 0) for t in h1)
+                sum_v    = sum(float(t.get("size") or 0) for t in h1)
+                vwap     = round(sum_pv / sum_v, 4) if sum_v > 0 else None
+                sig.update({
+                    "vol_1h":        round(vol_1h, 0),   # total $ vol last hour
+                    "vol_15m":       round(vol_15m, 0),  # $ vol last 15 min
+                    "vol_ratio":     vol_ratio,           # >1.5=surging, <0.5=drying up
+                    "buy_pressure":  buy_pressure,        # 0.6+=more buyers than sellers
+                    "vwap":          vwap,                # vol-weighted avg price
+                })
+    except Exception:
+        pass  # volume is optional — price signals still valid without it
+
+    return sig
+
 
 def _chart_entry_ok(sig, entry):
     """Return (ok: bool, reason: str). False = skip this Model E entry.
 
-    Filters:
-    - RSI > CHART_RSI_OVERBOUGHT: price already spiked, likely to retrace
-    - 30m momentum / entry > CHART_CHASE_LIMIT: we'd be chasing a spike
-    - Strong downtrend (trend_ph < -0.05) + negative 30m momentum: market disagrees
+    Price filters: RSI overbought, chasing 30m spike, strong downtrend.
+    Volume filters: volume drying up (vol_ratio < 0.3) signals conviction is fading.
     """
     if not sig:
         return True, ""
-    rsi = sig["rsi"]
+    rsi    = sig["rsi"]
     mom_30 = sig["mom_30m"]
-    trend = sig["trend_ph"]
+    trend  = sig["trend_ph"]
     if rsi > CHART_RSI_OVERBOUGHT:
         return False, f"overbought_rsi({rsi:.0f})"
     if entry > 0 and mom_30 / entry > CHART_CHASE_LIMIT:
         return False, f"chasing_30m(+{mom_30/entry*100:.0f}%)"
     if trend < -0.05 and mom_30 < -0.08:
         return False, f"downtrend({trend:+.3f}/hr)"
+    # Volume: if we have data and volume is drying up fast with sell pressure, skip
+    vol_ratio    = sig.get("vol_ratio")
+    buy_pressure = sig.get("buy_pressure")
+    if vol_ratio is not None and buy_pressure is not None:
+        if vol_ratio < 0.3 and buy_pressure < 0.35:
+            return False, f"vol_drying(ratio={vol_ratio},buy={buy_pressure})"
     return True, ""
 
 
@@ -475,9 +519,19 @@ def _ask_claude(key, title, outcome, entry, cur, gain, age_h, wallet, sig=None):
     chart_ctx = ""
     if sig:
         trend_dir = "uptrend" if sig["trend_ph"] > 0.02 else ("downtrend" if sig["trend_ph"] < -0.02 else "flat")
+        vol_ctx = ""
+        if sig.get("vol_ratio") is not None:
+            vr = sig["vol_ratio"]
+            bp = sig.get("buy_pressure", 0.5)
+            vwap = sig.get("vwap")
+            vol_trend = "surging" if vr > 1.5 else ("drying up" if vr < 0.5 else "steady")
+            pressure = "buy-heavy" if bp > 0.6 else ("sell-heavy" if bp < 0.4 else "balanced")
+            vwap_str = f" | VWAP {vwap:.3f} ({'above' if sig['current'] > vwap else 'below'} VWAP)" if vwap else ""
+            vol_ctx = f" | vol {vol_trend} (ratio {vr:.1f}x) | {pressure} ({bp:.0%} buys){vwap_str}"
         chart_ctx = (
             f"\nChart (last 1h): RSI {sig['rsi']:.0f} | trend {trend_dir} ({sig['trend_ph']:+.3f}/hr) | "
-            f"30m momentum {sig['mom_30m']:+.3f} | support {sig['support']:.3f} | resistance {sig['resistance']:.3f}."
+            f"30m momentum {sig['mom_30m']:+.3f} | support {sig['support']:.3f} | resistance {sig['resistance']:.3f}"
+            f"{vol_ctx}."
         )
     prompt = (
         f"You manage a Polymarket COPY position (mirroring trader {wallet}).\n"
@@ -614,8 +668,35 @@ def export():
                      "ORDER BY id DESC LIMIT 150").fetchall()
     decisions = [dict(ts=d[0], wallet=d[1], title=(d[2] or "")[:80], entry=d[3],
                       current=d[4], gain=round((d[5] or 0) * 100, 1), decision=d[6], why=d[7]) for d in decs]
+
+    # Health / meta for dashboard (lag, open risk, rough activity)
+    lags = []
+    for ct, tt in c.execute("SELECT copied_ts, their_ts FROM copies WHERE their_ts IS NOT NULL"):
+        try:
+            lags.append(datetime.fromisoformat(ct).timestamp() - int(tt))
+        except Exception:
+            pass
+    lag_p50 = round(lags[len(lags)//2]/60, 1) if lags else None
+
+    total_at_risk = sum(r["at_risk"] for r in [agg.get((mk, t), {"at_risk":0}) for t in WALLETS for mk,_ in MODELS])
+    # crude recent claude activity count (last 24h decisions as proxy)
+    try:
+        recent_claude = c.execute(
+            "SELECT COUNT(*) FROM decisions WHERE ts >= datetime('now','-24 hours')"
+        ).fetchone()[0]
+    except Exception:
+        recent_claude = 0
+
+    meta = {
+        "lag_p50_min": lag_p50,
+        "wallets": len(WALLETS),
+        "open_risk": round(total_at_risk, 2),
+        "claude_calls_24h": recent_claude,
+        "note": "E entry filter: RSI>78 or 30m momentum/entry >18%"
+    }
+
     os.makedirs("docs", exist_ok=True)
-    json.dump(dict(updated=now_iso(), models=models, traders=traders, decisions=decisions),
+    json.dump(dict(updated=now_iso(), models=models, traders=traders, decisions=decisions, meta=meta),
               open("docs/data.json", "w"))
     print("export: traders=%d, model totals:" % len(traders),
           {mn: models[mn]["value"] for _, mn in MODELS})
