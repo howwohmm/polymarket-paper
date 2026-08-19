@@ -61,16 +61,22 @@ Cost: free (public repo + tiny runners). The bot rate-caps Claude Haiku calls pe
 ## usage (local / debug)
 
 ```bash
-python3 copybot.py tick          # scan recent activity for the WALLETS, paper-copy new buys
-python3 copybot.py resolve       # mark-to-market opens + settle anything that resolved
-python3 copybot.py claude_decide # (model C only) ask Claude on moved positions (needs ANTHROPIC_API_KEY)
-python3 copybot.py export        # rebuild docs/data.json for the dashboard
-python3 copybot.py report        # human summary (realized, win rates, lag)
+pip install -e ".[dev]"     # installs the copybot/copytrade CLIs + dev deps
+copybot tick                # scan recent activity for the WALLETS, paper-copy new buys
+copybot resolve             # mark-to-market opens + settle anything that resolved
+copybot claude_decide       # (model C only) ask Claude on moved positions (needs ANTHROPIC_API_KEY)
+copybot export              # rebuild docs/data.json + quality.json + e_skips.json for the dashboard
+copybot report              # human summary (realized, win rates, lag) — all five models
 
-python3 copytrade.py leaderboard 30d     # discovery: who is actually printing on Polymarket
-python3 copytrade.py profile <wallet>
-python3 copytrade.py copytest <wallet> 12   # lag-adjusted historical mirror test (does their edge survive 12m delay?)
+copytrade leaderboard 30d     # discovery: who is actually printing on Polymarket
+copytrade profile <wallet>
+copytrade copytest <wallet> 12   # lag-adjusted historical mirror test (does their edge survive 12m delay?)
 ```
+
+The whole HTTP+Claude layer is mocked in `tests/` — `pytest` runs fully offline, no keys, no
+network, and covers the trading logic (tick dedup, bankroll accounting, B/D/E exits,
+dashboard export shape). `copybot.py`/`copytrade.py` work as both scripts and installed
+console entry points.
 
 To add a trader: run the copytrade tools to vet the wallet. Then add `Name: "0x..."` to the `WALLETS` dict in `copybot.py` and let it collect its first copies.
 
@@ -95,7 +101,9 @@ More data comes first. A model plus a subset of traders must show persistent pos
 - `copybot.py`: the live engine (tick/resolve/Claude/export/report)
 - `copytrade.py`: offline research + wallet vetting CLI (no keys needed)
 - `paper_trader.py`: the original fade experiment (mostly historical now)
-- `docs/index.html` + `docs/data.json`: the entire public dashboard (pure static, zero backend, Manrope + quiet dark per the design system)
+- `docs/index.html`, `docs/data.json`, `docs/quality.json`, `docs/e_skips.json`: the entire public dashboard (pure static, zero backend, Manrope + quiet dark per the design system)
+- `tests/`: offline pytest suite mocking the Polymarket/Claude HTTP layer
+- `pyproject.toml`: packaging + console scripts (`copybot`, `copytrade`) + pytest/ruff config
 - `.github/workflows/copybot.yml`: the reliable near-continuous runner + cache for state
 - `copybot.db` (local only, gitignored): working state for the runner
 
@@ -104,7 +112,7 @@ More data comes first. A model plus a subset of traders must show persistent pos
 ## next improvements (pull requests welcome)
 
 - Richer dashboard (equity history sparklines in pure SVG, per-trader position drilldown, filter by market type, win-rate columns more prominent).
-- Persist + surface "E skip reasons" counts and per-model expectancy / drawdown style metrics.
+- Per-model expectancy / drawdown-style metrics surfaced alongside the existing E-skip reasons, now tracked in `docs/e_skips.json`.
 - Tune or relax chart filters for E once we have enough skips logged.
 - Optional: Dune-powered (or LB sweep) wallet discovery refresh, for more names that survive lag + copytest.
 - Model F ideas: resolution-aware sizing, mean-reversion on spikes, or multi-leg.
