@@ -35,7 +35,9 @@ def leaderboard(window="30d", limit=20):
     print(f"  {'#':>2}  {'trader':<20}{'profit':>15}")
     for i, r in enumerate(rows, 1):
         print(f"  {i:>2}  {(r.get('name') or r.get('pseudonym') or '?')[:20]:<20}{('$' + format(r.get('amount', 0), ',.0f')):>15}")
-    print(f"  (wallets: {', '.join(r['proxyWallet'] for r in rows[:3])} ...)\n")
+    # proxyWallet / proxy_wallet may be absent from some responses — show whichever exists
+    print("  (wallets: " + ", ".join(
+        r.get("proxyWallet") or r.get("proxy_wallet") or "0x…" for r in rows[:3]) + " ...)\n")
     return rows
 
 
@@ -145,13 +147,19 @@ def copytest(addr, lag_min=10, max_trades=80):
     print("  note: assumes hold-to-resolution (ignores their early exits); no spread/fee added\n")
 
 
-if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "leaderboard"
+def main(argv=None):
+    """CLI entry point. Commands: leaderboard, profile, copytest."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = argv[0] if argv else "leaderboard"
     if cmd == "leaderboard":
-        leaderboard(sys.argv[2] if len(sys.argv) > 2 else "30d")
+        leaderboard(argv[1] if len(argv) > 1 else "30d")
     elif cmd == "profile":
-        profile(sys.argv[2])
+        profile(argv[1])
     elif cmd == "copytest":
-        copytest(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else 10)
+        copytest(argv[1], argv[2] if len(argv) > 2 else 10)
     else:
         print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
