@@ -41,6 +41,8 @@ def _conn():
     ("Will Trump win the presidency?", "politics"),
     ("Will T1 win the League of Legends Worlds?", "esports"),
     ("esports: which team wins?", "esports"),
+    ("Will Real Madrid win the Champions League?", "sports"),
+    ("Who wins the Premier League this season?", "sports"),
     ("Fetch a glass of water?", "other"),
 ])
 def test_categorize_market(title, expected):
@@ -211,7 +213,7 @@ def test_tick_inserts_and_dedups(monkeypatch, tmp_path):
     assert not (tmp_path / "docs" / "e_skips.json").exists()
 
 
-def test_tick_respects_cash_gate_and_hold_window(monkeypatch):
+def test_tick_skips_hold_model_outside_resolve_window(monkeypatch):
     now = int(__import__("time").time())
     # far-out market (10d) => hold model skipped; only exit/cdecide/trail/chart remain
     cid = "cidA"
@@ -224,6 +226,30 @@ def test_tick_respects_cash_gate_and_hold_window(monkeypatch):
     models = {r[0] for r in c.execute("SELECT DISTINCT model FROM copies")}
     assert "hold" not in models
     assert {"exit", "cdecide", "trail", "chart"} <= models
+
+
+def test_tick_cash_gate_stops_when_wallet_exhausted(monkeypatch):
+    """Exercise the `_cash < STAKE` guard: each trader's $20 wallet funds exactly 10
+    $2 copies per model, so the 11th trade in a model must be dropped."""
+    now = int(__import__("time").time())
+    cid = "cg"
+    # 11 trades in ONE market (all resolve within hold window) -> hold model included
+    trades = [_mk_trade(f"asset{i}", cid, now - 30 * (i + 1),
+                        title="Will the Eagles win the NFC title?") for i in range(11)]
+    mocks = _TickMocks([("0xaaaa", trades)], {cid: _mk_market(cid, 1)})
+    monkeypatch.setattr(copybot, "get", mocks.fake_get)
+    monkeypatch.setattr(copybot, "chart_signal", lambda _a: None)
+    copybot.tick()
+    c = _conn()
+    # Wallet funds 10 copies per model (hold/exit/cdecide/trail/chart) = 50 max,
+    # but each of the 11 trades would also want to open 5 => cash gate drops the rest.
+    # No key reuse (unique tx+ts per trade), so the cap is pure cash: <= 5*10 = 50.
+    rows = c.execute("SELECT count(*) FROM copies").fetchone()[0]
+    assert rows == 50  # 5 models x 10 funded copies; the 11th trade's copies all cash-gated
+    # By model no model may exceed 10 copies (the $20 / $2 cap).
+    per_model = dict(c.execute("SELECT model, count(*) FROM copies GROUP BY model"))
+    assert all(v <= 10 for v in per_model.values())
+    assert max(per_model.values()) == 10
 
 
 def test_tick_counts_and_persists_e_skips(monkeypatch, tmp_path):

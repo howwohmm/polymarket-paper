@@ -91,9 +91,13 @@ def categorize_market(title: str, slug: str = "", question: str = "") -> str:
             return "crypto_h"
     # esports must be checked BEFORE the generic "sports" keyword, otherwise
     # "esports" (substring of "sports") gets miscategorized as traditional sports.
-    if "esports" in t or "league" in t:
+    # Use SPECIFIC esports markers only — bare "league" is too broad and would
+    # mislabel traditional sports ("Champions League", "Premier League") as esports.
+    if "esports" in t or "league of legends" in t or "worlds" in t:
         return "esports"
-    if any(x in t for x in ["nba", "nfl", "mlb", "nhl", "tennis", "soccer", "world cup", "sports", "goal", "points"]):
+    if any(x in t for x in ["nba", "nfl", "mlb", "nhl", "tennis", "soccer", "world cup",
+                            "champions league", "premier league", "laliga", "la liga",
+                            "sports", "goal", "points"]):
         return "sports"
     if any(x in t for x in ["election", "president", "senate", "trump", "harris", "politics", "vote"]):
         return "politics"

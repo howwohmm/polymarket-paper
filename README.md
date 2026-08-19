@@ -65,7 +65,7 @@ pip install -e ".[dev]"     # installs the copybot/copytrade CLIs + dev deps
 copybot tick                # scan recent activity for the WALLETS, paper-copy new buys
 copybot resolve             # mark-to-market opens + settle anything that resolved
 copybot claude_decide       # (model C only) ask Claude on moved positions (needs ANTHROPIC_API_KEY)
-copybot export              # rebuild docs/data.json + quality.json + e_skips.json for the dashboard
+copybot export             # rebuild docs/data.json + quality.json for the dashboard (reads docs/e_skips.json, written by tick)
 copybot report              # human summary (realized, win rates, lag) — all five models
 
 copytrade leaderboard 30d     # discovery: who is actually printing on Polymarket
