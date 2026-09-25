@@ -5,6 +5,15 @@ launchd.err.log
 __pycache__/
 *.pyc
 
+# Python packaging / build + tooling caches
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.tmp
+
 # SQLite state (copybot.db especially) is large + high-churn binary.
 # Do NOT track in git — use GitHub Actions cache (see copybot.yml) to carry
 # live DB state between scheduled runs without poisoning history or bloating clones.

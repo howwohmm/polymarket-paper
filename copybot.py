@@ -3,20 +3,26 @@
 Polymarket COPYBOT — paper forward-test of mirroring vetted traders.
 
 We can't backtest these traders (their bets are still open), so this forward-tests:
-every time a tracked wallet BUYs, we record a paper copy at a fixed $10 notional at the
-price available, then track it. As markets resolve we book realized P&L; open positions
-are marked to current price. ROI (bankroll-independent) is the metric that matters.
+every time a tracked wallet BUYs, we record a paper copy at a fixed $2 notional within
+each trader's own $20 bankroll at the price available, then track it. As markets
+resolve we book realized P&L; open positions are marked to current price. ROI
+(bankroll-independent) is the metric that matters.
 
 Self-healing/idempotent: each tick re-reads recent trades and only inserts ones we
 haven't copied yet (deduped by tx+asset), so missed/throttled runs lose nothing.
 
-Tracked wallets were vetted for copyability: small clip ($5-15, a $10 copy can ride),
+Tracked wallets were vetted for copyability: small clip ($5-15, a $2 copy can ride),
 taker (not a maker/rebate farmer), diversified, slow/lag-tolerant markets.
 
 Commands:
-  python3 copybot.py tick      # detect tracked wallets' new buys, record paper copies
-  python3 copybot.py resolve   # settle resolved copies; mark open ones to current price
-  python3 copybot.py report    # realized + unrealized copy P&L, per wallet and total
+  python3 copybot.py tick          # detect tracked wallets' new buys, record paper copies
+  python3 copybot.py resolve       # settle resolved copies; mark open ones to current price
+  python3 copybot.py claude_decide # (model C) ask Claude whether moved positions are HOLD/SELL
+  python3 copybot.py export        # rebuild docs/data.json + quality.json for the dashboard
+  python3 copybot.py report        # realized + unrealized copy P&L, per model and total
+
+Five models, each trader gets their own $20 bankroll per model:
+  A hold | B exit +15%/36h | C Claude decides | D stop-loss+trailing | E chart-filtered entry + D exits
 """
 import json
 import os
@@ -83,12 +89,18 @@ def categorize_market(title: str, slug: str = "", question: str = "") -> str:
     if any(x in t for x in ["hour", "up or down", "crypto"]) and "5m" not in t:
         if any(x in t for x in ["btc", "eth", "sol"]):
             return "crypto_h"
-    if any(x in t for x in ["nba", "nfl", "mlb", "nhl", "tennis", "soccer", "world cup", "sports", "goal", "points"]):
+    # esports must be checked BEFORE the generic "sports" keyword, otherwise
+    # "esports" (substring of "sports") gets miscategorized as traditional sports.
+    # Use SPECIFIC esports markers only — bare "league" is too broad and would
+    # mislabel traditional sports ("Champions League", "Premier League") as esports.
+    if "esports" in t or "league of legends" in t or "worlds" in t:
+        return "esports"
+    if any(x in t for x in ["nba", "nfl", "mlb", "nhl", "tennis", "soccer", "world cup",
+                            "champions league", "premier league", "laliga", "la liga",
+                            "sports", "goal", "points"]):
         return "sports"
     if any(x in t for x in ["election", "president", "senate", "trump", "harris", "politics", "vote"]):
         return "politics"
-    if "esports" in t or "league" in t:
-        return "esports"
     return "other"
 
 # vetted copyable traders (small clip, taker, diversified, slow markets)
@@ -121,6 +133,29 @@ def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=25) as r:
         return json.loads(r.read().decode())
+
+
+def _atomic_write_json(path, obj):
+    """Write obj as pretty UTF-8 JSON atomically (tmp file + os.replace).
+
+    The dashboard payloads (docs/data.json, docs/quality.json, docs/e_skips.json) are
+    the only public output of this project, and the runner writes them on a live cron.
+    A plain open().write() can leave a truncated/corrupt file if the job is interrupted
+    mid-write — which would take the whole static dashboard down. Atomic replace means
+    readers always see a complete file. ensure_ascii=False keeps non-ASCII market titles
+    human-readable in the raw JSON too.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# Model E skip tracking — count WHY chart-aware entries were filtered so we can tell
+# whether the E gates are too strict (starving the model) or too loose. Reset per tick
+# run, persisted to docs/e_skips.json so it survives across workflow invocations.
+E_SKIP_COUNTS = {}
 
 
 def chart_signal(token_id):
@@ -273,7 +308,6 @@ def db():
         c.execute("ALTER TABLE copies ADD COLUMN model TEXT DEFAULT 'hold'")  # A=hold, B=exit
     except Exception:
         pass
-    c.execute("CREATE TABLE IF NOT EXISTS market_end(condition_id TEXT PRIMARY KEY, end_date TEXT)")
     for col in ("last_check TEXT", "last_reason TEXT", "peak REAL"):
         try:
             c.execute(f"ALTER TABLE copies ADD COLUMN {col}")
@@ -303,36 +337,6 @@ def _cash(c, model, trader):
 
 def _credit(c, model, trader, amount):
     c.execute("UPDATE bankroll SET cash=cash+? WHERE model=? AND trader=?", (amount, model, trader))
-
-
-_endcache = {}
-
-
-def _resolves_soon(cid, c):
-    """True if this market resolves within MAX_HOLD_RESOLVE_DAYS. Caches end dates
-    (in-memory + db) so we only look up each market once. Unknown/unfetchable -> False
-    (skip, since a short test can't wait on an unknown resolution)."""
-    if not cid:
-        return False
-    if cid in _endcache:
-        ed = _endcache[cid]
-    else:
-        row = c.execute("SELECT end_date FROM market_end WHERE condition_id=?", (cid,)).fetchone()
-        if row:
-            ed = row[0]
-        else:
-            m = _market_by_condition(cid)
-            ed = m.get("endDate") if m else None
-            c.execute("INSERT OR REPLACE INTO market_end(condition_id,end_date) VALUES(?,?)", (cid, ed))
-        _endcache[cid] = ed
-    if not ed:
-        return False
-    try:
-        end = datetime.fromisoformat(ed.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        return now < end <= now + timedelta(days=MAX_HOLD_RESOLVE_DAYS)
-    except Exception:
-        return False
 
 
 # only copy VERY fresh trades so our entry ~= the trader's fill (a true forward test).
@@ -380,6 +384,7 @@ def tick():
     now = int(time.time())
     added = 0
     skipped_chart = 0
+    E_SKIP_COUNTS.clear()
     mkt_cache = {}    # condition_id -> gamma market data
     chart_cache = {}  # asset (token_id) -> chart_signal result
     for name, addr in WALLETS.items():
@@ -446,6 +451,7 @@ def tick():
                     ok, reason = _chart_entry_ok(sig, entry)
                     if not ok:
                         skipped_chart += 1
+                        E_SKIP_COUNTS[reason] = E_SKIP_COUNTS.get(reason, 0) + 1
                         continue  # chart says skip this entry
                 key = f"{base}:{model}"
                 if c.execute("SELECT 1 FROM copies WHERE key=?", (key,)).fetchone():
@@ -461,6 +467,18 @@ def tick():
                 _credit(c, model, name, -STAKE)     # lock stake out of THIS trader's wallet
                 added += 1
         c.commit()
+    # Persist Model E filter skip-reasons (per reason) so the dashboard can show whether
+    # the chart gates are too strict — a roadmap item in the README. Cleared when a run
+    # filters nothing so stale reasons don't linger.
+    if skipped_chart > 0:
+        _atomic_write_json("docs/e_skips.json",
+                           {"updated": now_iso(), "skipped": skipped_chart,
+                            "reasons": dict(sorted(E_SKIP_COUNTS.items(), key=lambda kv: -kv[1]))})
+    elif Path("docs/e_skips.json").exists():
+        try:
+            os.remove("docs/e_skips.json")
+        except OSError:
+            pass
     print(f"tick: recorded {added} new paper copies across {len(WALLETS)} wallets "
           f"(chart filtered {skipped_chart} entries)")
 
@@ -754,30 +772,41 @@ def export():
     except Exception:
         recent_claude = 0
 
+    # Surface Model E filter skip-reasons (written by tick) on the dashboard meta.
+    e_skips = {}
+    if Path("docs/e_skips.json").exists():
+        try:
+            e_skips = json.load(open("docs/e_skips.json", encoding="utf-8")).get("reasons", {})
+        except Exception:
+            e_skips = {}
+
     meta = {
         "lag_p50_min": lag_p50,
         "wallets": len(WALLETS),
         "open_risk": round(total_at_risk, 2),
         "claude_calls_24h": recent_claude,
+        "e_skips": e_skips,
         "note": "E entry filter: RSI>78 or 30m momentum/entry >18%"
     }
 
     os.makedirs("docs", exist_ok=True)
-    json.dump(dict(updated=now_iso(), models=models, traders=traders, decisions=decisions, meta=meta),
-              open("docs/data.json", "w"))
+    _atomic_write_json("docs/data.json",
+                       dict(updated=now_iso(), models=models, traders=traders,
+                            decisions=decisions, meta=meta))
     print("export: traders=%d, model totals:" % len(traders),
           {mn: models[mn]["value"] for _, mn in MODELS})
 
-    # SDD v2: dump quality matrix (category specialization scores) for dashboard intelligence
+    # SDD v2: dump quality matrix (category specialization scores) for dashboard
+    # intelligence — one row per category categorize_market() can return.
+    QUALITY_CATS = ["sports", "crypto_5m", "politics", "crypto_h", "esports", "other"]
     quality = []
     for trader in list(WALLETS.keys()):
         row = {"name": trader}
-        for cat in ["sports", "crypto_5m", "politics", "crypto_h", "other"]:
+        for cat in QUALITY_CATS:
             q = _get_trader_cat_quality(c, trader, cat)
             row[cat] = q
         quality.append(row)
-    with open("docs/quality.json", "w") as f:
-        json.dump({"updated": now_iso(), "quality": quality}, f)
+    _atomic_write_json("docs/quality.json", {"updated": now_iso(), "quality": quality})
     print("export: also wrote docs/quality.json (trader x category edge matrix)")
 
 
@@ -802,19 +831,27 @@ def report():
     c = db()
     rows = c.execute("SELECT COALESCE(model,'hold'),status,stake,pnl FROM copies").fetchall()
     print("\n" + "=" * 64)
-    print("  POLYMARKET COPYBOT — two parallel models ($10/copy)")
+    print("  POLYMARKET COPYBOT — five models ($2/copy, $20 wallet/trader/model)")
     print("=" * 64)
     if not rows:
         print("  no copies yet — run tick.\n"); return
     hold = [(r[1], r[2], r[3]) for r in rows if r[0] == "hold"]
     exit_ = [(r[1], r[2], r[3]) for r in rows if r[0] == "exit"]
     cdec = [(r[1], r[2], r[3]) for r in rows if r[0] == "cdecide"]
+    trail = [(r[1], r[2], r[3]) for r in rows if r[0] == "trail"]
+    chart = [(r[1], r[2], r[3]) for r in rows if r[0] == "chart"]
     _model_block("MODEL A: copy & HOLD to resolution", hold, "(slow — markets resolve weeks out)")
     print()
     _model_block("MODEL B: copy & SELL at +%d%% / %dh cap" % (TAKE_PROFIT * 100, MAX_HOLD_HOURS),
                  exit_, "(fast — closes in 1-3 days)")
     print()
     _model_block("MODEL C: Claude decides HOLD/SELL", cdec, "(AI exits — see dashboard for whys)")
+    print()
+    _model_block("MODEL D: cut losers (-%d%%) / trailing stop (+%d%%, -%d%%)" %
+                 (STOP_LOSS * 100, TRAIL_ACTIVATE * 100, TRAIL_DROP * 100),
+                 trail, "(stop-loss + trailing stop)")
+    print()
+    _model_block("MODEL E: chart-filtered entry + D exits", chart, "(skip bad charts entirely)")
     # detection lag
     lags = []
     for ct, tt in c.execute("SELECT copied_ts, their_ts FROM copies WHERE their_ts IS NOT NULL"):
@@ -828,7 +865,13 @@ def report():
     print("=" * 64 + "\n")
 
 
-if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
+def main(argv=None):
+    """CLI entry point. Commands: tick, resolve, claude_decide, export, report."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = argv[0] if argv else "report"
     {"tick": tick, "resolve": resolve, "report": report,
      "claude_decide": claude_decide, "export": export}.get(cmd, report)()
+
+
+if __name__ == "__main__":
+    main()
